@@ -1151,215 +1151,150 @@ export default function Crucible(){
   const [availableMics,  setAvailableMics]  = useState([]);
   const [selectedMicId,  setSelectedMicId]  = useState("");    // "" = system default
   const [showMicSelector,setShowMicSelector]= useState(false);
-  const recognitionRef = useRef(null);
-  // Detect sandboxed iframe — Web Speech API is blocked in this environment
-  const inIframe = useRef(typeof window !== "undefined" && window !== window.top);
-  const dictBaseRef    = useRef("");
-  const finalAccRef    = useRef("");
-  const dictFieldRef   = useRef(null);
-  const lastFocusRef   = useRef(null);
-  const [flaggedItems, setFlaggedItems] = useState(new Set());
-  const [reviewQueue,  setReviewQueue]  = useState([]);
-  const [showReview,   setShowReview]   = useState(false);
-  const [rubricMeta,   setRubricMeta]   = useState(INITIAL_RUBRIC_META);
+  // ── Deepgram Medical Dictation ──────────────────────────────────────────────
+  // Uses MediaRecorder to capture audio in chunks, sends each chunk to our
+  // Netlify serverless proxy which forwards to Deepgram Nova-2 Medical.
+  // No Google dependency — works on any network including VPN.
 
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef   = useRef([]);
+  const dictFieldRef     = useRef(null);
+  const lastFocusRef     = useRef(null);
 
-  useEffect(()=>{
-    const l=document.createElement("link");
-    l.href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=DM+Mono:wght@300;400;500&display=swap";
-    l.rel="stylesheet"; document.head.appendChild(l);
-    return()=>{try{document.head.removeChild(l);}catch(e){}};
-  },[]);
-
-  useEffect(()=>{
-    if(phase!=="dictate") return;
-    const t=setInterval(()=>setElapsed(e=>e+1),1000);
-    return()=>clearInterval(t);
-  },[phase]);
-
-  const sfHasContent=Object.values(sfFields).some(v=>v.trim().length>3);
-  const canSubmit=inputMode==="structured"
-    ?(sfHasContent||impression.trim().length>3)
-    :(findings.trim().length>10||impression.trim().length>10);
-
-  const wordCount=inputMode==="structured"
-    ?[...Object.values(sfFields).join(" ").split(/\s+/),...impression.split(/\s+/)].filter(Boolean).length
-    :[...findings.split(/\s+/),...impression.split(/\s+/)].filter(Boolean).length;
-
-  const handleSubmit=async()=>{
-    if(!canSubmit) return;
-    setPhase("loading"); setApiError(null); setFlaggedItems(new Set()); setShowReport(false);
-    setVerbosity("succinct");
-    const prompt=buildPrompt(inputMode,sfFields,findings,impression);
-    await evaluateReport(
-      prompt,
-      result=>{
-        setFeedback(result);
-        setPhase("feedback");
-        // Auto-populate review queue with any flagged sections
-        const flagged = (result.sections||[]).filter(s=>s.review_flag);
-        if(flagged.length > 0){
-          const newItems = flagged.map((s,i)=>({
-            id: `${Date.now()}-${i}`,
-            timestamp: new Date().toISOString(),
-            caseId: CASE.id,
-            caseDescription: CASE.description,
-            rubricVersion: rubricMeta.version,
-            sectionLabel: s.label,
-            tier: s.review_tier || 2,
-            reviewNote: s.review_note || "",
-            traineeContent: getTraineeSectionContent(s.label, inputMode, sfFields, findings, impression),
-            status: "pending",
-            reviewerNote: "",
-            rubricUpdateNote: null,
-          }));
-          setReviewQueue(prev=>[...newItems, ...prev]);
-        }
-      },
-      msg=>{setApiError(msg); setPhase("dictate");}
-    );
-  };
-
-  // ── Mode toggle with bidirectional conversion ──────────────────────────────
-
-  // ── Dictation ────────────────────────────────────────────────────────────────
-  // Uses Web Speech API with a flag-based stop guard (avoids stale-closure bugs
-  // and the Chrome InvalidStateError on rapid start/stop cycles).
-
-  const isStoppingRef  = useRef(false);
-
-  // Stable state-setter helpers (recreated each render, always current)
   const getFieldValue = (id) => {
     if(id==="findings")   return findings;
     if(id==="impression") return impression;
     return sfFields[id]||"";
   };
+
   const setFieldValue = (id, val) => {
     if(id==="findings")   { setFindings(val);   return; }
     if(id==="impression") { setImpression(val); return; }
     setSfFields(prev=>({...prev,[id]:val}));
   };
 
-  // Always create a FRESH recognition instance on every startDictation call.
-  // Reusing the same instance across sessions causes Chrome to stop immediately
-  // after the first use — destroying and recreating fixes this reliably.
-  const createRecognition = () => {
-    // Destroy any existing instance cleanly first
-    if(recognitionRef.current){
-      try {
-        recognitionRef.current.onresult = null;
-        recognitionRef.current.onerror  = null;
-        recognitionRef.current.onend    = null;
-        recognitionRef.current.abort();
-      } catch(e){}
-      recognitionRef.current = null;
+  // Send accumulated audio to Deepgram via our serverless proxy
+  const transcribeChunks = async (chunks, fieldId, baseText) => {
+    if(!chunks.length) return;
+    const blob = new Blob(chunks, { type:"audio/webm" });
+    try {
+      const resp = await fetch("/api/deepgram", {
+        method:  "POST",
+        headers: { "Content-Type":"audio/webm" },
+        body:    blob,
+      });
+      if(!resp.ok) throw new Error(`Deepgram error ${resp.status}`);
+      const data = await resp.json();
+      const transcript = data?.results?.channels?.[0]
+        ?.alternatives?.[0]?.transcript || "";
+      if(transcript.trim()){
+        const sep = baseText && !baseText.endsWith(" ") &&
+                    !baseText.endsWith("\n") ? " " : "";
+        setFieldValue(fieldId, baseText + sep + transcript);
+      }
+    } catch(err){
+      console.log("[Crucible] Deepgram transcription error:", err.message);
+      setApiError("Transcription failed: " + err.message);
     }
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if(!SR) return null;
-    const rec = new SR();
-    rec.continuous     = true;
-    rec.interimResults = true;
-    rec.maxAlternatives = 1;
-    rec.lang           = "en-US";
-    recognitionRef.current = rec;
-    return rec;
   };
 
   const stopDictation = () => {
-    isStoppingRef.current = true;
-    if(recognitionRef.current){
-      try { recognitionRef.current.stop(); } catch(e){}
+    if(mediaRecorderRef.current &&
+       mediaRecorderRef.current.state !== "inactive"){
+      mediaRecorderRef.current.stop();
     }
+    mediaRecorderRef.current = null;
     const fld = dictFieldRef.current;
-    if(fld && finalAccRef.current.trim())
-      setFixableFields(prev=>new Set([...prev, fld]));
+    if(fld) setFixableFields(prev=>new Set([...prev, fld]));
     dictFieldRef.current = null;
     setDictatingField(null);
   };
 
-  const startDictation = (fieldId) => {
-    if(inIframe.current){ setApiError("__iframe__"); return; }
+  const startDictation = async (fieldId) => {
+    // Stop any running session first
+    if(dictFieldRef.current) stopDictation();
 
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if(!SR){
-      setApiError("Speech recognition is not supported in this browser. Please use Chrome or Edge.");
+    // Request microphone access
+    let stream;
+    try {
+      const constraints = { audio: selectedMicId
+        ? { deviceId:{ exact: selectedMicId } }
+        : true };
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch(err){
+      if(err.name === "NotAllowedError"){
+        setApiError("Microphone permission denied — please allow microphone access for this site in your browser settings.");
+      } else if(err.name === "NotFoundError"){
+        setApiError("No microphone found — please connect a microphone and try again.");
+      } else {
+        setApiError("Could not access microphone: " + err.message);
+      }
       return;
     }
 
-    if(dictFieldRef.current) stopDictation();
+    const baseText = getFieldValue(fieldId);
+    dictFieldRef.current = fieldId;
+    setDictatingField(fieldId);
+    audioChunksRef.current = [];
 
-    const rec = createRecognition();
-    if(!rec) return;
+    // Set up MediaRecorder — sends audio every 3 seconds for near-real-time feel
+    let recorder;
+    try {
+      recorder = new MediaRecorder(stream, { mimeType:"audio/webm" });
+    } catch(e){
+      // Fallback if audio/webm not supported
+      recorder = new MediaRecorder(stream);
+    }
+    mediaRecorderRef.current = recorder;
 
-    rec.onstart = () => {
-      console.log("[Crucible] Recognition started OK");
-    };
+    // Accumulate the full transcript as we go
+    let accumulatedText = baseText;
 
-    rec.onresult = (e) => {
-      console.log("[Crucible] onresult fired");
-      let fin="", intr="";
-      for(let i=e.resultIndex; i<e.results.length; i++){
-        if(e.results[i].isFinal) fin  += e.results[i][0].transcript;
-        else                     intr += e.results[i][0].transcript;
-      }
-      if(fin) finalAccRef.current += fin;
-      const base = dictBaseRef.current;
-      const sep  = base && !base.endsWith(" ") && !base.endsWith("\n") ? " " : "";
-      const display = finalAccRef.current + intr;
-      setFieldValue(dictFieldRef.current, base + (display ? sep : "") + display);
-    };
-
-    rec.onerror = (e) => {
-      console.log("[Crucible] onerror:", e.error);
-      if(e.error === "not-allowed" || e.error === "permission-denied"){
-        setApiError("Microphone permission denied — please allow microphone access for this site in your browser.");
-        stopDictation();
-      } else if(e.error === "no-speech"){
-        console.log("[Crucible] no-speech — will restart via onend");
-      } else if(e.error === "audio-capture"){
-        setApiError("No microphone detected. Please check your microphone is connected and selected.");
-        stopDictation();
-      } else if(e.error !== "aborted"){
-        console.log("[Crucible] unexpected error, stopping:", e.error);
-        stopDictation();
-      }
-    };
-
-    rec.onend = () => {
-      console.log("[Crucible] onend fired. stopping=", isStoppingRef.current, "field=", dictFieldRef.current);
-      if(isStoppingRef.current || !dictFieldRef.current) return;
-      // Chrome fires onend even with continuous:true — restart after short delay
-      setTimeout(() => {
-        if(!isStoppingRef.current && dictFieldRef.current){
-          console.log("[Crucible] Restarting recognition…");
-          try {
-            const fresh = createRecognition();
-            // Re-attach handlers by calling startDictation internals
-            fresh.onstart  = rec.onstart;
-            fresh.onresult = rec.onresult;
-            fresh.onerror  = rec.onerror;
-            fresh.onend    = rec.onend;
-            fresh.start();
-          } catch(e){
-            console.log("[Crucible] restart failed:", e.message);
+    recorder.ondataavailable = async (e) => {
+      if(e.data.size < 500) return; // skip tiny silent chunks
+      const chunk = e.data;
+      const prevText = accumulatedText;
+      // Transcribe this chunk
+      const blob = new Blob([chunk], { type: recorder.mimeType });
+      try {
+        const resp = await fetch("/api/deepgram", {
+          method:  "POST",
+          headers: { "Content-Type": recorder.mimeType },
+          body:    blob,
+        });
+        if(resp.ok){
+          const data = await resp.json();
+          const t = data?.results?.channels?.[0]
+            ?.alternatives?.[0]?.transcript || "";
+          if(t.trim()){
+            const sep = accumulatedText &&
+              !accumulatedText.endsWith(" ") &&
+              !accumulatedText.endsWith("\n") ? " " : "";
+            accumulatedText = accumulatedText + sep + t;
+            // Only update if this field is still active
+            if(dictFieldRef.current === fieldId){
+              setFieldValue(fieldId, accumulatedText);
+            }
           }
         }
-      }, 300);
+      } catch(err){
+        console.log("[Crucible] chunk transcription error:", err.message);
+      }
     };
 
-    isStoppingRef.current = false;
-    dictBaseRef.current   = getFieldValue(fieldId);
-    finalAccRef.current   = "";
-    dictFieldRef.current  = fieldId;
-    setDictatingField(fieldId);
+    recorder.onstop = () => {
+      // Stop all microphone tracks to release the mic indicator in browser
+      stream.getTracks().forEach(t => t.stop());
+    };
 
-    console.log("[Crucible] Calling rec.start()…");
-    try {
-      rec.start();
-    } catch(e){
-      console.log("[Crucible] rec.start() threw:", e.name, e.message);
-      if(e.name !== "InvalidStateError") stopDictation();
-    }
+    recorder.onerror = (e) => {
+      console.log("[Crucible] MediaRecorder error:", e);
+      stopDictation();
+    };
+
+    // Fire ondataavailable every 3 seconds while recording
+    recorder.start(3000);
+    console.log("[Crucible] Deepgram recording started for field:", fieldId);
   };
 
   const toggleDictation = (fieldId) => {
@@ -1367,20 +1302,21 @@ export default function Crucible(){
     else startDictation(fieldId);
   };
 
-  // Fix medical terms for a field via Claude Haiku
+  // Fix medical terms for a field via Claude Haiku (second-pass correction)
   const fixTerms = async (fieldId) => {
     const text = getFieldValue(fieldId);
     if(!text.trim()) return;
     setFixingField(fieldId);
     try{
-      const resp = await fetch("https://api.anthropic.com/v1/messages",{
+      const resp = await fetch("/api/messages",{
         method:"POST", headers:{"Content-Type":"application/json"},
         body:JSON.stringify({
           model:"claude-haiku-4-5-20251001", max_tokens:700,
           messages:[{role:"user",content:
 `You are a medical transcription editor. The following text was dictated by a radiologist via voice recognition.
-Correct ONLY misheard medical, anatomical, or radiological terminology (e.g. "right lower lobe" not "right lower load", "consolidation" not "condensation", "costophrenic" not "costophrenic angle").
-Do NOT change meaning, add findings, or alter correctly transcribed words. Preserve all punctuation and line breaks.
+Correct ONLY misheard medical, anatomical, or radiological terminology.
+Do NOT change meaning, add findings, or alter correctly transcribed words.
+Preserve all punctuation and line breaks.
 Return ONLY the corrected text — no explanation, no preamble.
 
 Text: ${text}`}],
@@ -1391,37 +1327,30 @@ Text: ${text}`}],
         const fixed = d.content.map(b=>b.text||"").join("").trim();
         if(fixed) setFieldValue(fieldId, fixed);
       }
-    }catch(e){}
+    }catch(e){ console.log("[Crucible] fixTerms error:", e); }
     setFixingField(null);
     setFixableFields(prev=>{ const n=new Set(prev); n.delete(fieldId); return n; });
   };
 
-  // Load available microphones.
-  // enumerateDevices alone works once permission has been granted via Web Speech API.
-  // We attempt getUserMedia only as a fallback to populate device labels.
+  // Load available microphones
   const loadMics = async () => {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
       const mics = devices.filter(d=>d.kind==="audioinput");
-      // If labels are empty (permission not yet granted), request via getUserMedia
       if(mics.every(m=>!m.label)){
         try {
           const stream = await navigator.mediaDevices.getUserMedia({audio:true});
           stream.getTracks().forEach(t=>t.stop());
           const refreshed = await navigator.mediaDevices.enumerateDevices();
           setAvailableMics(refreshed.filter(d=>d.kind==="audioinput"));
-        } catch(e){
-          setAvailableMics(mics); // show unlabelled mics
-        }
+        } catch(e){ setAvailableMics(mics); }
       } else {
         setAvailableMics(mics);
       }
-    } catch(e){
-      setAvailableMics([]);
-    }
+    } catch(e){ setAvailableMics([]); }
   };
 
-  // Alt+D → toggle dictation on last focused field (or first field)
+  // Alt+D keyboard shortcut
   useEffect(()=>{
     const handler = (e) => {
       if(e.altKey && e.key.toLowerCase()==="d"){
