@@ -1417,6 +1417,52 @@ Text: ${text}`}],
     }
   };
 
+  // ── Derived state ────────────────────────────────────────────────────────────
+  const wordCount = inputMode==="structured"
+    ? [...Object.values(sfFields).join(" ").split(/\s+/),
+       ...impression.split(/\s+/)].filter(Boolean).length
+    : [...findings.split(/\s+/),
+       ...impression.split(/\s+/)].filter(Boolean).length;
+
+  const canSubmit = inputMode==="structured"
+    ? (Object.values(sfFields).some(v=>v.trim().length>3) || impression.trim().length>3)
+    : (findings.trim().length>10 || impression.trim().length>10);
+
+  // ── Submit handler ────────────────────────────────────────────────────────────
+  const handleSubmit = async () => {
+    if(!canSubmit) return;
+    setPhase("loading"); setApiError(null); setFlaggedItems(new Set()); setShowReport(false);
+    setVerbosity("succinct");
+    const prompt = buildPrompt(inputMode, sfFields, findings, impression);
+    await evaluateReport(
+      prompt,
+      result => {
+        setFeedback(result);
+        setPhase("feedback");
+        // Auto-populate review queue with flagged sections
+        const flagged = (result.sections||[]).filter(s=>s.review_flag);
+        if(flagged.length > 0){
+          const newItems = flagged.map((s,i)=>({
+            id: `${Date.now()}-${i}`,
+            timestamp: new Date().toISOString(),
+            caseId: CASE.id,
+            caseDescription: CASE.description,
+            rubricVersion: rubricMeta.version,
+            sectionLabel: s.label,
+            tier: s.review_tier || 2,
+            reviewNote: s.review_note || "",
+            traineeContent: getTraineeSectionContent(s.label, inputMode, sfFields, findings, impression),
+            status: "pending",
+            reviewerNote: "",
+            rubricUpdateNote: null,
+          }));
+          setReviewQueue(prev=>[...newItems, ...prev]);
+        }
+      },
+      msg => { setApiError(msg); setPhase("dictate"); }
+    );
+  };
+
   const handleReset=()=>{
     setPhase("dictate"); setFindings(""); setImpression("");
     setSfFields(BLANK_SF); setElapsed(0); setFeedback(null);
