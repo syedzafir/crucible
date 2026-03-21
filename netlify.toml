@@ -1,0 +1,23 @@
+[build]
+  base    = "crucible"
+  command = "npm run build"
+  publish = "crucible/dist"
+  functions = "crucible/netlify/functions"
+
+# Anthropic API proxy
+[[redirects]]
+  from   = "/api/messages"
+  to     = "/.netlify/functions/api"
+  status = 200
+
+# Deepgram Medical proxy
+[[redirects]]
+  from   = "/api/deepgram"
+  to     = "/.netlify/functions/deepgram"
+  status = 200
+
+# SPA fallback
+[[redirects]]
+  from   = "/*"
+  to     = "/index.html"
+  status = 200
