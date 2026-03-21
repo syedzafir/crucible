@@ -96,7 +96,7 @@ function structuredToFree(fields) {
 // Free → Guided: Claude Haiku parses free text into anatomical fields
 async function parseToStructured(findings, impression, onComplete, onError) {
   try {
-    const resp = await fetch("/api/messages", {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
@@ -256,7 +256,7 @@ Return ONLY valid JSON, no markdown:
 // in sandboxed browser environments where TCP close signals are unpredictable.
 async function evaluateReport(prompt, onComplete, onError) {
   try {
-    const resp = await fetch("/api/messages", {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
@@ -1240,16 +1240,26 @@ export default function Crucible(){
     setSfFields(prev=>({...prev,[id]:val}));
   };
 
-  // Build/reuse the recognition instance
-  // onresult/onend/onerror are re-attached on every startDictation call so they
-  // are never stale.
-  const ensureRecognition = () => {
-    if(recognitionRef.current) return recognitionRef.current;
+  // Always create a FRESH recognition instance on every startDictation call.
+  // Reusing the same instance across sessions causes Chrome to stop immediately
+  // after the first use — destroying and recreating fixes this reliably.
+  const createRecognition = () => {
+    // Destroy any existing instance cleanly first
+    if(recognitionRef.current){
+      try {
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror  = null;
+        recognitionRef.current.onend    = null;
+        recognitionRef.current.abort();
+      } catch(e){}
+      recognitionRef.current = null;
+    }
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if(!SR) return null;
     const rec = new SR();
     rec.continuous     = true;
     rec.interimResults = true;
+    rec.maxAlternatives = 1;
     rec.lang           = "en-US";
     recognitionRef.current = rec;
     return rec;
@@ -1282,7 +1292,8 @@ export default function Crucible(){
     // Stop any running session first
     if(dictFieldRef.current) stopDictation();
 
-    const rec = ensureRecognition();
+    // Always fresh instance — prevents Chrome's immediate-stop bug
+    const rec = createRecognition();
     if(!rec) return;
 
     // Attach fresh handlers so they close over current fieldId / refs
@@ -1343,7 +1354,7 @@ export default function Crucible(){
     if(!text.trim()) return;
     setFixingField(fieldId);
     try{
-      const resp = await fetch("/api/messages",{
+      const resp = await fetch("https://api.anthropic.com/v1/messages",{
         method:"POST", headers:{"Content-Type":"application/json"},
         body:JSON.stringify({
           model:"claude-haiku-4-5-20251001", max_tokens:700,
