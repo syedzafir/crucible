@@ -1278,26 +1278,25 @@ export default function Crucible(){
   };
 
   const startDictation = (fieldId) => {
-    // If in a sandboxed iframe (e.g. Claude artifact preview), mic is always blocked
-    if(inIframe.current){
-      setApiError("__iframe__");
-      return;
-    }
+    if(inIframe.current){ setApiError("__iframe__"); return; }
+
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if(!SR){
       setApiError("Speech recognition is not supported in this browser. Please use Chrome or Edge.");
       return;
     }
 
-    // Stop any running session first
     if(dictFieldRef.current) stopDictation();
 
-    // Always fresh instance — prevents Chrome's immediate-stop bug
     const rec = createRecognition();
     if(!rec) return;
 
-    // Attach fresh handlers so they close over current fieldId / refs
+    rec.onstart = () => {
+      console.log("[Crucible] Recognition started OK");
+    };
+
     rec.onresult = (e) => {
+      console.log("[Crucible] onresult fired");
       let fin="", intr="";
       for(let i=e.resultIndex; i<e.results.length; i++){
         if(e.results[i].isFinal) fin  += e.results[i][0].transcript;
@@ -1311,34 +1310,54 @@ export default function Crucible(){
     };
 
     rec.onerror = (e) => {
+      console.log("[Crucible] onerror:", e.error);
       if(e.error === "not-allowed" || e.error === "permission-denied"){
-        setApiError(inIframe.current ? "__iframe__" : "Microphone permission denied. Check your browser site settings for claude.ai.");
+        setApiError("Microphone permission denied — please allow microphone access for this site in your browser.");
         stopDictation();
       } else if(e.error === "no-speech"){
-        // Silence timeout — onend auto-restart handles this
+        console.log("[Crucible] no-speech — will restart via onend");
+      } else if(e.error === "audio-capture"){
+        setApiError("No microphone detected. Please check your microphone is connected and selected.");
+        stopDictation();
       } else if(e.error !== "aborted"){
+        console.log("[Crucible] unexpected error, stopping:", e.error);
         stopDictation();
       }
     };
 
-    // Auto-restart on natural end (Chrome stops after silence even with continuous=true)
     rec.onend = () => {
+      console.log("[Crucible] onend fired. stopping=", isStoppingRef.current, "field=", dictFieldRef.current);
       if(isStoppingRef.current || !dictFieldRef.current) return;
+      // Chrome fires onend even with continuous:true — restart after short delay
       setTimeout(() => {
         if(!isStoppingRef.current && dictFieldRef.current){
-          try { rec.start(); } catch(e){}
+          console.log("[Crucible] Restarting recognition…");
+          try {
+            const fresh = createRecognition();
+            // Re-attach handlers by calling startDictation internals
+            fresh.onstart  = rec.onstart;
+            fresh.onresult = rec.onresult;
+            fresh.onerror  = rec.onerror;
+            fresh.onend    = rec.onend;
+            fresh.start();
+          } catch(e){
+            console.log("[Crucible] restart failed:", e.message);
+          }
         }
-      }, 200);
+      }, 300);
     };
 
-    isStoppingRef.current   = false;
-    dictBaseRef.current     = getFieldValue(fieldId);
-    finalAccRef.current     = "";
-    dictFieldRef.current    = fieldId;
+    isStoppingRef.current = false;
+    dictBaseRef.current   = getFieldValue(fieldId);
+    finalAccRef.current   = "";
+    dictFieldRef.current  = fieldId;
     setDictatingField(fieldId);
 
-    try { rec.start(); } catch(e){
-      // Already started — this can happen on rapid double-click
+    console.log("[Crucible] Calling rec.start()…");
+    try {
+      rec.start();
+    } catch(e){
+      console.log("[Crucible] rec.start() threw:", e.name, e.message);
       if(e.name !== "InvalidStateError") stopDictation();
     }
   };
