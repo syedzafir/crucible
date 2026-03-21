@@ -1141,7 +1141,6 @@ export default function Crucible(){
   const [draft,        setDraft]       = useState(DEFAULT_MOUSE);
   const [feedback,     setFeedback]    = useState(null);
   const [verbosity,    setVerbosity]   = useState("succinct");
-  const [showReport,   setShowReport]   = useState(false);   // report viewer in feedback panel
   const [apiError,     setApiError]    = useState(null);
 
   // ── Dictation state ──────────────────────────────────────────────────────────
@@ -1151,6 +1150,10 @@ export default function Crucible(){
   const [availableMics,  setAvailableMics]  = useState([]);
   const [selectedMicId,  setSelectedMicId]  = useState("");    // "" = system default
   const [showMicSelector,setShowMicSelector]= useState(false);
+  const [showReview,   setShowReview]   = useState(false);
+  const [showReport,   setShowReport]   = useState(false);
+  const [reviewQueue,  setReviewQueue]  = useState([]);
+  const [rubricMeta,   setRubricMeta]   = useState(INITIAL_RUBRIC_META);
   // ── Deepgram Medical Dictation ──────────────────────────────────────────────
   // Uses MediaRecorder to capture audio in chunks, sends each chunk to our
   // Netlify serverless proxy which forwards to Deepgram Nova-2 Medical.
