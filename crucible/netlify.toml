@@ -3,10 +3,16 @@
   publish   = "dist"
   functions = "netlify/functions"
 
-# Route all /api/* requests to Netlify Functions
+# Route /api/messages → Anthropic proxy function
 [[redirects]]
-  from   = "/api/*"
-  to     = "/.netlify/functions/:splat"
+  from   = "/api/messages"
+  to     = "/.netlify/functions/api"
+  status = 200
+
+# Route /api/deepgram → Deepgram proxy function  
+[[redirects]]
+  from   = "/api/deepgram"
+  to     = "/.netlify/functions/deepgram"
   status = 200
 
 # SPA fallback — all unmatched routes serve index.html

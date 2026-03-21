@@ -1254,34 +1254,48 @@ export default function Crucible(){
     let accumulatedText = baseText;
 
     recorder.ondataavailable = async (e) => {
-      if(e.data.size < 500) return; // skip tiny silent chunks
-      const chunk = e.data;
-      const prevText = accumulatedText;
-      // Transcribe this chunk
-      const blob = new Blob([chunk], { type: recorder.mimeType });
+      console.log("[Crucible] chunk received, size:", e.data.size, "type:", recorder.mimeType);
+      if(e.data.size < 100) {
+        console.log("[Crucible] chunk too small, skipping");
+        return;
+      }
+      const blob = new Blob([e.data], { type: recorder.mimeType });
       try {
+        console.log("[Crucible] Sending to /api/deepgram…");
         const resp = await fetch("/api/deepgram", {
           method:  "POST",
           headers: { "Content-Type": recorder.mimeType },
           body:    blob,
         });
-        if(resp.ok){
-          const data = await resp.json();
-          const t = data?.results?.channels?.[0]
-            ?.alternatives?.[0]?.transcript || "";
-          if(t.trim()){
-            const sep = accumulatedText &&
-              !accumulatedText.endsWith(" ") &&
-              !accumulatedText.endsWith("\n") ? " " : "";
-            accumulatedText = accumulatedText + sep + t;
-            // Only update if this field is still active
-            if(dictFieldRef.current === fieldId){
-              setFieldValue(fieldId, accumulatedText);
-            }
+        console.log("[Crucible] Deepgram response status:", resp.status);
+        const data = await resp.json();
+        console.log("[Crucible] Deepgram response:", JSON.stringify(data).slice(0,200));
+
+        if(!resp.ok){
+          // Show error in UI so user can see it without opening console
+          const errMsg = data?.err_msg || data?.error || `Error ${resp.status}`;
+          setApiError("Deepgram error: " + errMsg);
+          return;
+        }
+
+        const t = data?.results?.channels?.[0]
+          ?.alternatives?.[0]?.transcript || "";
+        console.log("[Crucible] Transcript:", t);
+
+        if(t.trim()){
+          const sep = accumulatedText &&
+            !accumulatedText.endsWith(" ") &&
+            !accumulatedText.endsWith("\n") ? " " : "";
+          accumulatedText = accumulatedText + sep + t;
+          if(dictFieldRef.current === fieldId){
+            setFieldValue(fieldId, accumulatedText);
           }
+        } else {
+          console.log("[Crucible] No transcript in response (silence or unrecognised audio)");
         }
       } catch(err){
-        console.log("[Crucible] chunk transcription error:", err.message);
+        console.log("[Crucible] fetch error:", err.message);
+        setApiError("Dictation network error: " + err.message);
       }
     };
 
