@@ -1412,9 +1412,11 @@ export default function Crucible(){
     });
     // Append each keyterm individually (Deepgram expects repeated params)
     KEYTERMS.forEach(t => params.append("keyterm", t));
-    params.set("access_token", token);
+    // Auth via subprotocol — this is Deepgram's current required method.
+    // access_token as a URL param is deprecated and will be rejected.
     const ws = new WebSocket(
-      `wss://api.deepgram.com/v1/listen?${params}`
+      `wss://api.deepgram.com/v1/listen?${params}`,
+      ["token", token]   // ← token passed as WebSocket subprotocol
     );
     wsRef.current = ws;
 
