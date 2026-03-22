@@ -151,101 +151,57 @@ Return ONLY valid JSON, no markdown:
 // ── Prompt ─────────────────────────────────────────────────────────────────────
 function buildPrompt(mode, fields, findings, impression) {
   const reportBlock = mode === "structured"
-    ? `TRAINEE'S REPORT (Guided Mode):
-LUNGS: ${fields.lungs||"[Not described]"}
-PLEURAL SPACES: ${fields.pleural||"[Not described]"}
-CARDIOMEDIASTINAL: ${fields.cardiac||"[Not described]"}
-HILA: ${fields.hila||"[Not described]"}
-BONES & SOFT TISSUES: ${fields.bones||"[Not described]"}
-SUBDIAPHRAGMATIC: ${fields.subdiaphragm||"[Not described]"}
-DEVICES & LINES: ${fields.devices||"[Not described]"}
-IMPRESSION: ${impression||"[Not provided]"}`
-    : `TRAINEE'S REPORT (Free Dictation):
-FINDINGS:\n${findings||"[None]"}
-IMPRESSION:\n${impression||"[None]"}`;
+    ? `TRAINEE REPORT (Guided):\nLUNGS: ${fields.lungs||"[empty]"}\nPLEURAL: ${fields.pleural||"[empty]"}\nCARDIOMEDIASTINAL: ${fields.cardiac||"[empty]"}\nHILA: ${fields.hila||"[empty]"}\nBONES: ${fields.bones||"[empty]"}\nSUBDIAPHRAGMATIC: ${fields.subdiaphragm||"[empty]"}\nDEVICES: ${fields.devices||"[empty]"}\nIMPRESSION: ${impression||"[empty]"}`
+    : `TRAINEE REPORT (Free):\nFINDINGS: ${findings||"[empty]"}\nIMPRESSION: ${impression||"[empty]"}`;
 
-  return `You are an expert radiology educator evaluating a trainee's chest radiograph report.
+  return `You are an expert radiology educator. Evaluate this chest radiograph report against the reference.
 
 CASE: ${CASE.clinicalHistory}
 
-REFERENCE (board-certified radiologist):
-FINDINGS:
-${CASE.referenceFindings}
-IMPRESSION:
-${CASE.referenceImpression}
+REFERENCE REPORT:
+FINDINGS: ${CASE.referenceFindings}
+IMPRESSION: ${CASE.referenceImpression}
 
 ${reportBlock}
 
-CORE PRINCIPLE — ABSENCE EQUALS NORMAL:
-Any structure or finding NOT mentioned in the reference report must be treated as normal/unremarkable by default.
-Apply the following THREE-TIER classification when the trainee reports something not in the reference:
+SCORING RULES:
+- Absence from reference = normal. Any finding NOT in the reference is either: (a) OVERCALL if clearly contradicted → penalise, or (b) UNVERIFIABLE if possibly subtle → do not penalise, set review_flag:true.
+- Score bidirectionally: missing findings AND overcalled findings both reduce scores.
 
-TIER 1 — CONFIRMED OVERCALL:
-The finding is clearly contradicted by or incompatible with the reference (e.g., trainee reports left-sided consolidation when the reference left lung is unremarkable; trainee reports cardiomegaly when the reference states cardiomediastinal silhouette is normal).
-→ Flag explicitly as an overcall. Penalise in the relevant rubric category. Explain why it is unsupported.
-
-TIER 2 — POSSIBLE BUT UNVERIFIABLE:
-The finding is not in the reference but is not clearly contradicted either. It may represent a subtle finding below the expert's reporting threshold, a genuine perception difference, or a legitimate variant.
-Examples: subtle increased markings, minor vascular prominence, trace blunting not mentioned in reference.
-→ Do NOT penalise. Do NOT credit. State clearly: "This finding is not described in the reference report and cannot be confirmed or excluded from the current reference. Flagged for radiologist review."
-→ Set a flag in your response for this item: "review_flag": true
-
-TIER 3 — POSSIBLE CORRECT ADDITION (rare):
-The trainee identifies something that appears genuinely present and clinically significant, that the reference did not mention. This reflects perceptiveness that may exceed the reference.
-→ Acknowledge positively. Do not penalise. Note that the reference may warrant updating.
-→ Set "review_flag": true for this item as well.
-
-- If the trainee reports a region as normal/unremarkable and the reference does not mention that region, this is CORRECT — acknowledge positively.
-- Apply this three-tier principle to both findings and impression sections.
-
-RUBRIC:
-1. SYSTEMATIC COMPLETENESS (0–100): % of expected CXR regions addressed (cardiomediastinal, lungs bilateral, pleural spaces, hila, bones/soft tissues, subdiaphragmatic). Penalise both missed regions AND regions described with findings not supported by the reference.
-2. PRIMARY FINDING ACCURACY (Likert→0–100): Evaluate accuracy in BOTH directions. 1=primary finding missed entirely(0-20), 2=primary finding wrong or a major overcall present(21-40), 3=correct but incomplete(41-60), 4=correct with minor gaps or minor overcalls(61-80), 5=complete, accurate, no unsupported findings(81-100).
-3. CRITICAL FINDING IDENTIFICATION (0–100): Both consolidation AND effusion correctly identified=100; one identified=60; neither=0. Deduct 20 points for any additional critical-level finding reported that is not in the reference (overcalled critical finding).
-4. IMPRESSION QUALITY (Likert→0–100): Compare directly against reference impression. 1=absent/entirely wrong(0-20), 2=partial or contains unsupported diagnosis(21-40), 3=correct primary finding, minor issues(41-60), 4=correct and concise(61-80), 5=matches reference in content and style(81-100). Flag any diagnostic conclusions in the impression not supported by the reference findings.
-5. TERMINOLOGY (1–3→0–100): 1=imprecise or incorrect(0-33), 2=mostly appropriate(34-66), 3=precise and consistent with reference style(67-100).
+RUBRIC (each 0-100):
+1. SYSTEMATIC COMPLETENESS: % of CXR regions addressed (cardiomediastinal, lungs, pleural, hila, bones, subdiaphragmatic).
+2. PRIMARY FINDING ACCURACY: 0-20 missed, 21-40 wrong/overcall, 41-60 correct+incomplete, 61-80 correct+minor gaps, 81-100 complete+accurate.
+3. CRITICAL FINDING IDENTIFICATION: Both consolidation+effusion=100, one=60, neither=0. Overcalled critical finding: -20.
+4. IMPRESSION QUALITY: 0-20 absent, 21-40 partial/unsupported, 41-60 correct primary, 61-80 correct+concise, 81-100 matches reference.
+5. TERMINOLOGY: 0-33 imprecise, 34-66 mostly ok, 67-100 precise+standard.
 
 WEIGHTS: completeness 20%, primary 25%, critical 25%, impression 20%, terminology 10%.
-GRADE: A(90+) A-(85-89) B+(80-84) B(75-79) B-(70-74) C+(65-69) C(60-64) <60=needs work.
+GRADE: A≥90, A-≥85, B+≥80, B≥75, B-≥70, C+≥65, C≥60, <60=needs work.
 
-IMPORTANT — feedback format:
-- For each section provide TWO levels of feedback:
-  detail_short: exactly ONE sentence (max 20 words). The single most important point, including any overcall if present.
-  detail_long: TWO to THREE sentences (max 60 words). Specific, actionable, educational. Name any overcalled or missed findings explicitly.
-- Also provide summary_short (one sentence, max 25 words) and summary_long (two sentences, max 50 words).
-- If the trainee's report is accurate and complete with no overcalls, say so clearly — positive reinforcement matters.
-- For each section assign a sentiment:
-  "correct"   → trainee performed well; finding correctly identified, well described, impression accurate.
-  "incorrect" → clear error; missed finding, confirmed overcall, wrong characterisation, absent impression.
-  "uncertain" → mixed, partial, Tier 2/3 flag, borderline, or cannot fully assess.
-- For each section include "annotations": an array identifying SPECIFIC PHRASES from the trainee's
-  text with individual sentiments. This enables phrase-level highlighting in the UI.
-  Rules:
-  • Copy each phrase EXACTLY as the trainee wrote it (verbatim substring match required).
-  • A single field can contain multiple phrases with DIFFERENT sentiments — annotate each separately.
-  • Example: trainee writes "RLL consolidation and possible LUL opacity" →
-    [{"text":"RLL consolidation","sentiment":"correct"},{"text":"possible LUL opacity","sentiment":"uncertain"}]
-  • Only annotate findings/descriptions — not connecting words like "and", "with", "no".
-  • If the entire field content has one sentiment, a single annotation covering the key phrase is enough.
-  • Use empty array [] if nothing specific to annotate in a section.
+Provide TWO feedback levels per section:
+- detail_short: 1 sentence, max 20 words.
+- detail_long: 2-3 sentences, max 60 words.
+Also: summary_short (1 sentence, max 25 words), summary_long (2 sentences, max 50 words).
+Sentiment per section: "correct", "incorrect", or "uncertain".
+If report is accurate with no overcalls, say so clearly.
 
-Return ONLY valid JSON, no markdown:
+Return ONLY valid JSON:
 {
   "overall": <int>,
   "grade": "<string>",
-  "summary_short": "<one sentence>",
-  "summary_long": "<two sentences>",
+  "summary_short": "<string>",
+  "summary_long": "<string>",
   "sections": [
     {
       "label": "<string>",
       "score": <int>,
-      "sentiment": "<correct | incorrect | uncertain>",
-      "detail_short": "<one sentence>",
-      "detail_long": "<two to three sentences>",
-      "review_flag": <true if Tier 2 or Tier 3 finding present in this section, otherwise false>,
-      "review_tier": <2 for "possible but unverifiable", 3 for "possible correct addition", null if no flag>,
-      "review_note": "<one sentence describing the flagged finding, or null if no flag>",
-      "annotations": [{"text":"<exact phrase from trainee>","sentiment":"<correct|incorrect|uncertain>"}]
+      "sentiment": "<correct|incorrect|uncertain>",
+      "detail_short": "<string>",
+      "detail_long": "<string>",
+      "review_flag": <bool>,
+      "review_tier": <2|3|null>,
+      "review_note": "<string|null>",
+      "annotations": [{"text":"<exact phrase>","sentiment":"<correct|incorrect|uncertain>"}]
     }
   ]
 }`;
@@ -1604,8 +1560,9 @@ Text: ${text}` }],
     if(!canSubmit) return;
     setPhase("loading"); setApiError(null); setFlaggedItems(new Set()); setShowReport(false);
     setVerbosity("succinct");
-    const prompt = buildPrompt(inputMode, sfFields, findings, impression);
-    await evaluateReport(
+    try {
+      const prompt = buildPrompt(inputMode, sfFields, findings, impression);
+      await evaluateReport(
       prompt,
       result => {
         setFeedback(result);
@@ -1631,7 +1588,12 @@ Text: ${text}` }],
         }
       },
       msg => { setApiError(msg); setPhase("dictate"); }
-    );
+      );
+    } catch(e) {
+      // Safety net — loading screen can never get permanently stuck
+      setApiError("Something went wrong: " + (e.message || "unknown error"));
+      setPhase("dictate");
+    }
   };
 
   const handleReset=()=>{

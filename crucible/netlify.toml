@@ -3,17 +3,7 @@
   publish   = "dist"
   functions = "netlify/functions"
 
-# Increase function timeout to 30 seconds (default is 10s — too short for AI calls)
-[functions]
-  node_bundler = "esbuild"
-
-[functions."api"]
-  timeout = 30
-
-[functions."deepgram-token"]
-  timeout = 10
-
-# Route all /api/* calls to their respective serverless functions
+# Route /api/* to serverless functions
 [[redirects]]
   from   = "/api/messages"
   to     = "/.netlify/functions/api"
@@ -29,7 +19,7 @@
   to     = "/.netlify/functions/deepgram"
   status = 200
 
-# SPA fallback — all unmatched routes serve index.html
+# SPA fallback — must be last
 [[redirects]]
   from   = "/*"
   to     = "/index.html"

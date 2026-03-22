@@ -1,65 +1,43 @@
 /**
  * Netlify serverless function: /api/messages
  * Proxies requests to the Anthropic API.
- * ANTHROPIC_API_KEY must be set in Netlify → Site configuration → Environment variables.
+ * Set ANTHROPIC_API_KEY in Netlify → Site configuration → Environment variables.
  */
-export default async (request) => {
-  // Handle CORS preflight
-  if(request.method === "OPTIONS"){
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "Access-Control-Allow-Origin":  "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-      },
-    });
-  }
-
-  if(request.method !== "POST"){
+export default async (request, context) => {
+  if (request.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  const apiKey = (process.env.ANTHROPIC_API_KEY || "").trim();
-  if(!apiKey){
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
     return new Response(
-      JSON.stringify({ error: "ANTHROPIC_API_KEY not configured in Netlify environment variables." }),
-      { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
-    );
-  }
-
-  let body;
-  try {
-    body = await request.json();
-  } catch(e) {
-    return new Response(
-      JSON.stringify({ error: "Invalid JSON in request body." }),
-      { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+      JSON.stringify({ error: "ANTHROPIC_API_KEY not configured." }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
     );
   }
 
   try {
+    const body = await request.json();
+
     const upstream = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type":      "application/json",
         "x-api-key":         apiKey,
         "anthropic-version": "2023-06-01",
-        // No anthropic-beta header — it caused conflicts with claude-haiku-4-5
       },
       body: JSON.stringify(body),
     });
 
-    // Always parse as text first — Anthropic can return non-JSON on some errors
     const text = await upstream.text();
+
+    // Try to parse as JSON; if it fails, return a structured error
     let data;
     try {
       data = JSON.parse(text);
-    } catch(e) {
-      // Upstream returned non-JSON (e.g. 502/504 HTML error page)
-      console.error("[Crucible] Anthropic non-JSON response:", text.slice(0, 200));
+    } catch (e) {
       return new Response(
-        JSON.stringify({ error: `Upstream error (HTTP ${upstream.status}): ${text.slice(0, 200)}` }),
+        JSON.stringify({ error: `Upstream returned non-JSON (HTTP ${upstream.status}). Check Anthropic API status.` }),
         { status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
       );
     }
@@ -72,8 +50,7 @@ export default async (request) => {
       },
     });
 
-  } catch(err) {
-    console.error("[Crucible] api.js error:", err.message);
+  } catch (err) {
     return new Response(
       JSON.stringify({ error: "Proxy error: " + err.message }),
       { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
