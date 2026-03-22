@@ -1143,15 +1143,14 @@ export default function Crucible(){
   const [verbosity,    setVerbosity]   = useState("succinct");
   const [apiError,     setApiError]    = useState(null);
 
-  // ── Dictation state ─────────────────────────────────────────────────────────
-  // Deepgram Nova-2 — WebSocket streaming for near-instant transcription.
-  // Flow:
-  //   1. startDictation() reads VITE_DEEPGRAM_API_KEY (baked in at Vite build time)
-  //   2. Opens a WebSocket to wss://api.deepgram.com/v1/listen
-  //   3. getUserMedia audio streams into the WebSocket as raw PCM
-  //   4. Deepgram sends back interim (live) + final transcripts
-  //   5. Interim words appear immediately; final words are locked in
-  //   6. stopDictation() closes the socket and releases the mic
+  // ── Dictation — Deepgram Nova-3 Medical WebSocket streaming ─────────────────
+  // Architecture:
+  //   Browser → POST /api/deepgram-token → get API key server-side
+  //   Browser → WebSocket wss://api.deepgram.com/v1/listen (auth via subprotocol)
+  //   getUserMedia → AudioContext → ScriptProcessor → send raw Int16 PCM chunks
+  //   Deepgram streams back interim (live preview) + final (locked) transcripts
+  //   KeepAlive ping every 8s keeps the connection alive during silence
+  //   CloseStream message sent before socket.close() for clean shutdown
 
   const [dictatingField, setDictatingField] = useState(null);
   const [fixableFields,  setFixableFields]  = useState(new Set());
@@ -1163,35 +1162,44 @@ export default function Crucible(){
   const [showReport,     setShowReport]     = useState(false);
   const [reviewQueue,    setReviewQueue]    = useState([]);
   const [rubricMeta,     setRubricMeta]     = useState(INITIAL_RUBRIC_META);
-  const [interimText,    setInterimText]    = useState("");  // live words not yet final
+  const [interimText,    setInterimText]    = useState("");
 
-  const wsRef          = useRef(null);   // Deepgram WebSocket
-  const mediaStreamRef = useRef(null);   // getUserMedia stream
-  const processorRef   = useRef(null);   // AudioWorkletNode / ScriptProcessorNode
-  const audioCtxRef    = useRef(null);   // AudioContext
-  const dictFieldRef   = useRef(null);   // active field id (stable across closures)
-  const finalTextRef   = useRef("");     // all finalised text this session
-  const baseTextRef    = useRef("");     // text in field before session started
-  const lastFocusRef   = useRef(null);
+  // Refs — stable across renders, safe to use inside WebSocket callbacks
+  const wsRef          = useRef(null);    // Deepgram WebSocket
+  const mediaStreamRef = useRef(null);    // getUserMedia stream
+  const processorRef   = useRef(null);    // ScriptProcessorNode
+  const audioCtxRef    = useRef(null);    // AudioContext
+  const keepAliveRef   = useRef(null);    // keepalive interval id
+  const dictFieldRef   = useRef(null);    // current active field id
+  const finalTextRef   = useRef("");      // all finalised transcript this session
+  const baseTextRef    = useRef("");      // text in field before session started
+  const lastFocusRef   = useRef(null);    // last focused field (for Alt+D)
 
-  // ── Stable value/setter helpers ───────────────────────────────────────────
+  // ── Stable field accessors ────────────────────────────────────────────────
   const getFieldValue = (id) => {
-    if(id==="findings")   return findings;
-    if(id==="impression") return impression;
-    return sfFields[id]||"";
+    if(id === "findings")   return findings;
+    if(id === "impression") return impression;
+    return sfFields[id] || "";
   };
-
   const setFieldValue = (id, val) => {
-    if(id==="findings")   { setFindings(val);   return; }
-    if(id==="impression") { setImpression(val); return; }
-    setSfFields(prev=>({...prev,[id]:val}));
+    if(id === "findings")   { setFindings(val);   return; }
+    if(id === "impression") { setImpression(val); return; }
+    setSfFields(prev => ({ ...prev, [id]: val }));
   };
 
-  // ── Core dictation functions ──────────────────────────────────────────────
+  // ── Stop dictation ────────────────────────────────────────────────────────
   const stopDictation = () => {
-    // Close WebSocket cleanly
+    // Cancel keepalive ping
+    if(keepAliveRef.current){
+      clearInterval(keepAliveRef.current);
+      keepAliveRef.current = null;
+    }
+    // Send CloseStream then close socket
     if(wsRef.current){
-      try{ wsRef.current.close(); }catch(e){}
+      if(wsRef.current.readyState === WebSocket.OPEN){
+        try{ wsRef.current.send(JSON.stringify({ type:"CloseStream" })); }catch(e){}
+      }
+      try{ wsRef.current.close(1000); }catch(e){}
       wsRef.current = null;
     }
     // Disconnect audio graph
@@ -1203,177 +1211,169 @@ export default function Crucible(){
       try{ audioCtxRef.current.close(); }catch(e){}
       audioCtxRef.current = null;
     }
-    // Release microphone
+    // Release microphone (removes the browser mic indicator)
     if(mediaStreamRef.current){
-      mediaStreamRef.current.getTracks().forEach(t=>t.stop());
+      mediaStreamRef.current.getTracks().forEach(t => t.stop());
       mediaStreamRef.current = null;
     }
-    // Mark field as fixable if something was dictated
+    // Mark field as fixable if content was dictated this session
     const fld = dictFieldRef.current;
-    if(fld && finalTextRef.current.trim()){
-      setFixableFields(prev=>new Set([...prev, fld]));
-    }
+    if(fld && finalTextRef.current.trim())
+      setFixableFields(prev => new Set([...prev, fld]));
     dictFieldRef.current = null;
     setDictatingField(null);
     setInterimText("");
   };
 
+  // ── Start dictation ───────────────────────────────────────────────────────
   const startDictation = async (fieldId) => {
-    // Stop any existing session
+    // Stop any existing session first
     if(dictFieldRef.current) stopDictation();
 
-    // ── Step 1: Get Deepgram API key (baked in at build time via Vite) ──────────
-    // Key is set as VITE_DEEPGRAM_API_KEY in Netlify environment variables.
-    // Vite replaces import.meta.env.VITE_DEEPGRAM_API_KEY at build time.
-    const token = import.meta.env.VITE_DEEPGRAM_API_KEY;
-    if(!token){
-      setApiError("Deepgram API key not found. Add VITE_DEEPGRAM_API_KEY to Netlify environment variables and redeploy.");
+    // Step 1: Get API key from server-side token function
+    let token;
+    try {
+      const resp = await fetch("/api/deepgram-token", { method:"POST" });
+      const data = await resp.json();
+      if(!resp.ok || data.error) throw new Error(data.error || "Token fetch failed (HTTP " + resp.status + ")");
+      token = (data.key || "").replace(/^Token\s+/i, "").trim();
+      if(!token) throw new Error("Empty key returned from token function");
+    } catch(err) {
+      setApiError(
+        "Cannot start dictation: " + err.message +
+        " — check DEEPGRAM_API_KEY is set in Netlify → Site configuration → Environment variables."
+      );
       return;
     }
 
-    // ── Step 2: Request microphone ────────────────────────────────────────────
+    // Step 2: Request microphone
     let stream;
     try {
-      const constraints = {
-        audio: selectedMicId
-          ? { deviceId:{ exact:selectedMicId }, sampleRate:16000, channelCount:1 }
-          : { sampleRate:16000, channelCount:1 }
+      const constraints = { audio: selectedMicId
+        ? { deviceId:{ exact: selectedMicId }, sampleRate:16000, channelCount:1 }
+        : { sampleRate:16000, channelCount:1 }
       };
       stream = await navigator.mediaDevices.getUserMedia(constraints);
     } catch(err) {
-      if(err.name==="NotAllowedError"){
-        setApiError("Microphone permission denied — please allow microphone access for this site in your browser settings.");
-      } else if(err.name==="NotFoundError"){
-        setApiError("No microphone found — please connect a microphone and try again.");
-      } else {
-        setApiError("Could not access microphone: " + err.message);
-      }
+      const msg = err.name === "NotAllowedError"
+        ? "Microphone permission denied — click the lock icon in your browser bar and allow microphone access."
+        : err.name === "NotFoundError"
+        ? "No microphone found — please connect one and try again."
+        : "Microphone error: " + err.message;
+      setApiError(msg);
       return;
     }
-
     mediaStreamRef.current = stream;
 
-    // ── Step 3: Set up state for this session ─────────────────────────────────
+    // Step 3: Initialise session state
     baseTextRef.current  = getFieldValue(fieldId);
     finalTextRef.current = "";
     dictFieldRef.current = fieldId;
     setDictatingField(fieldId);
     setInterimText("");
 
-    // ── Step 4: Open Deepgram WebSocket ───────────────────────────────────────
-    // Nova-2 Medical model — best accuracy for radiology terminology
-    // Note: keyterms are NOT passed as URL params — 367 terms makes the URL
-    // too long for Deepgram's WebSocket handshake (>8KB limit).
-    // Instead, Haiku Fix Terms provides post-correction of medical vocabulary.
+    // Step 4: Build WebSocket URL with params
     const params = new URLSearchParams({
-      model:           "nova-2",   // nova-2 available on all Deepgram tiers
+      model:           "nova-3-medical",  // Nova-3 Medical for radiology accuracy
       language:        "en-US",
-      smart_format:    "true",     // auto punctuation + capitalisation
-      interim_results: "true",     // live words as you speak
-      utterance_end_ms:"800",      // finalise after 0.8s silence
+      smart_format:    "true",   // punctuation + capitalisation
+      interim_results: "true",   // live word preview
+      utterance_end_ms:"1000",   // finalise after 1s silence
       encoding:        "linear16",
       sample_rate:     "16000",
       channels:        "1",
     });
-    // Auth: token in URL — most reliable method from browser environments.
-    // The key is baked into the build via VITE_, not sent from a server.
-    params.set("access_token", token);
+
+    // Open WebSocket — auth via Sec-WebSocket-Protocol header (browser-safe method)
+    // Deepgram docs: "use the Sec-WebSocket-Protocol header instead [of Authorization]
+    // in client-side environments where custom headers are not supported"
     const ws = new WebSocket(
-      `wss://api.deepgram.com/v1/listen?${params}`
+      `wss://api.deepgram.com/v1/listen?${params}`,
+      ["token", token]   // sets Sec-WebSocket-Protocol: token, <key>
     );
     wsRef.current = ws;
 
+    // Step 5: On open — set up audio pipeline + keepalive
     ws.onopen = () => {
-      // ── Step 5: Pipe mic audio into WebSocket as raw PCM (linear16) ─────────
+      // Audio pipeline: getUserMedia → AudioContext → ScriptProcessor → PCM chunks
       const audioCtx = new AudioContext({ sampleRate:16000 });
       audioCtxRef.current = audioCtx;
-      const source  = audioCtx.createMediaStreamSource(stream);
-
-      // ScriptProcessorNode — widely supported fallback
-      // (AudioWorklet is better but requires a separate .js file)
-      const bufferSize = 4096;
-      const processor  = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+      const source    = audioCtx.createMediaStreamSource(stream);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
 
       processor.onaudioprocess = (e) => {
         if(!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-        const float32 = e.inputBuffer.getChannelData(0);
-        // Convert Float32 → Int16 PCM
-        const int16 = new Int16Array(float32.length);
-        for(let i=0; i<float32.length; i++){
-          int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
-        }
-        wsRef.current.send(int16.buffer);
+        const f32 = e.inputBuffer.getChannelData(0);
+        const i16 = new Int16Array(f32.length);
+        for(let i=0; i<f32.length; i++)
+          i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+        wsRef.current.send(i16.buffer);
       };
 
       source.connect(processor);
       processor.connect(audioCtx.destination);
+
+      // KeepAlive — required by Deepgram to maintain connection during silence
+      // Docs recommend sending every 8–10 seconds
+      keepAliveRef.current = setInterval(() => {
+        if(wsRef.current && wsRef.current.readyState === WebSocket.OPEN)
+          wsRef.current.send(JSON.stringify({ type:"KeepAlive" }));
+      }, 8000);
     };
 
-    // ── Step 6: Handle incoming transcripts ───────────────────────────────────
+    // Step 6: Handle incoming transcripts
     ws.onmessage = (e) => {
       let msg;
-      try { msg = JSON.parse(e.data); } catch{ return; }
+      try{ msg = JSON.parse(e.data); }catch{ return; }
       if(msg.type !== "Results") return;
 
-      const alt      = msg.channel?.alternatives?.[0];
-      const text     = alt?.transcript || "";
-      const isFinal  = msg.is_final;
-
-      if(!text) return;
-
-      const isSpeechFinal = msg.speech_final;
+      const text    = msg.channel?.alternatives?.[0]?.transcript || "";
+      const isFinal = msg.is_final;
+      if(!text.trim()) return;
 
       if(isFinal){
-        // Lock this transcript in permanently
-        const sep = finalTextRef.current &&
-          !finalTextRef.current.endsWith(" ") &&
-          !finalTextRef.current.endsWith("\n") ? " " : "";
+        // Lock this text permanently
+        const sep = finalTextRef.current && !finalTextRef.current.endsWith(" ") ? " " : "";
         finalTextRef.current += sep + text;
         setInterimText("");
       } else {
-        // Show live interim words (will be overwritten or finalised)
+        // Show live preview (will be overwritten or finalised)
         setInterimText(text);
       }
 
-      // Update the field: base + all finals + current interim
+      // Update field: base + all finals + current interim
       if(dictFieldRef.current === fieldId){
         const base    = baseTextRef.current;
         const finals  = finalTextRef.current;
         const interim = isFinal ? "" : text;
-        const sep     = (base && finals) && !base.endsWith(" ") &&
-                        !base.endsWith("\n") ? " " : "";
-        const interimSep = (base||finals) && interim &&
-                           !(finals||base).endsWith(" ") ? " " : "";
-        setFieldValue(
-          fieldId,
-          base +
-          (finals ? sep + finals : "") +
-          (interim ? interimSep + interim : "")
-        );
+        const sep1    = base && finals && !base.endsWith(" ") && !base.endsWith("\n") ? " " : "";
+        const sep2    = (base || finals) && interim && !(finals || base).endsWith(" ") ? " " : "";
+        setFieldValue(fieldId, base + (finals ? sep1 + finals : "") + (interim ? sep2 + interim : ""));
       }
     };
 
-    ws.onerror = (e) => {
-      console.error("[Crucible] Deepgram WebSocket error:", e);
+    // Step 7: Handle errors and disconnection
+    ws.onerror = () => {
+      // onerror always fires before onclose — onclose gives the specific code
+      // Don't show error here; wait for onclose for a more descriptive message
     };
 
     ws.onclose = (e) => {
-      console.log("[Crucible] WebSocket closed — code:", e.code, "reason:", e.reason);
-      if(!dictFieldRef.current) return; // clean stop, ignore
-      if(e.code === 1000){
-        // Normal close — no error
-      } else if(e.code === 1008 || e.code === 4001 || e.code === 4002){
-        setApiError("Deepgram authentication failed — check DEEPGRAM_API_KEY is set correctly in Netlify environment variables.");
-        stopDictation();
-      } else if(e.code === 1006){
-        // Abnormal close — usually auth rejection on connect
-        setApiError("Deepgram rejected the connection. Check: (1) DEEPGRAM_API_KEY is set in Netlify environment variables, (2) the Netlify function deployed successfully.");
-        stopDictation();
-      } else {
-        setApiError("Dictation disconnected (code " + e.code + (e.reason ? ": " + e.reason : "") + "). Tap mic to retry.");
-        stopDictation();
-      }
+      // Clean up keepalive regardless of close reason
+      if(keepAliveRef.current){ clearInterval(keepAliveRef.current); keepAliveRef.current = null; }
+
+      if(e.code === 1000) return; // Normal close — initiated by us
+
+      // Map Deepgram close codes to actionable messages
+      const msg = e.code === 1008
+        ? "Deepgram rejected the API key (policy violation). Check DEEPGRAM_API_KEY in Netlify environment variables — paste only the raw key, no 'Token ' prefix."
+        : e.code === 1011
+        ? "Deepgram server error. Try again — if it persists, check your Deepgram account status at console.deepgram.com."
+        : `Dictation disconnected (code ${e.code}). Tap the mic to restart.`;
+
+      if(dictFieldRef.current) setApiError(msg);
+      stopDictation();
     };
   };
 
@@ -1382,61 +1382,56 @@ export default function Crucible(){
     else startDictation(fieldId);
   };
 
-  // ── Fix Terms (Haiku post-correction pass) ────────────────────────────────
+  // ── Fix Terms — Claude Haiku post-correction pass ────────────────────────
   const fixTerms = async (fieldId) => {
     const text = getFieldValue(fieldId);
     if(!text.trim()) return;
     setFixingField(fieldId);
     try{
-      const resp = await fetch("/api/messages",{
+      const resp = await fetch("/api/messages", {
         method:"POST", headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({
-          model:"claude-haiku-4-5-20251001", max_tokens:700,
-          messages:[{role:"user",content:
-`You are a medical transcription editor. The following text was dictated by a radiologist via voice recognition.
-Correct ONLY misheard medical, anatomical, or radiological terminology.
-Do NOT change meaning, add findings, or alter correctly transcribed words.
-Preserve all punctuation and line breaks.
-Return ONLY the corrected text — no explanation, no preamble.
+        body: JSON.stringify({
+          model:"claude-haiku-4-5-20251001", max_tokens:600,
+          messages:[{ role:"user", content:
+`You are a medical transcription editor. Text was dictated by a radiologist and transcribed by speech recognition. Correct ONLY misheard medical, anatomical, or radiological terminology. Do NOT add findings, change meaning, or alter correctly transcribed content. Preserve all line breaks and punctuation. Return ONLY the corrected text — no explanation.
 
-Text: ${text}`}],
+Text: ${text}` }],
         }),
       });
       if(resp.ok){
         const d = await resp.json();
-        const fixed = d.content.map(b=>b.text||"").join("").trim();
+        const fixed = d.content.map(b => b.text || "").join("").trim();
         if(fixed) setFieldValue(fieldId, fixed);
       }
-    }catch(e){ console.log("[Crucible] fixTerms error:", e); }
+    }catch(e){}
     setFixingField(null);
-    setFixableFields(prev=>{ const n=new Set(prev); n.delete(fieldId); return n; });
+    setFixableFields(prev => { const n=new Set(prev); n.delete(fieldId); return n; });
   };
 
-  // ── Load available microphones ────────────────────────────────────────────
+  // ── Load microphone list ──────────────────────────────────────────────────
   const loadMics = async () => {
     try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const mics    = devices.filter(d=>d.kind==="audioinput");
-      if(mics.every(m=>!m.label)){
-        try {
-          const s = await navigator.mediaDevices.getUserMedia({audio:true});
-          s.getTracks().forEach(t=>t.stop());
-          const refreshed = await navigator.mediaDevices.enumerateDevices();
-          setAvailableMics(refreshed.filter(d=>d.kind==="audioinput"));
-        } catch(e){ setAvailableMics(mics); }
+      let devices = await navigator.mediaDevices.enumerateDevices();
+      const mics  = devices.filter(d => d.kind === "audioinput");
+      // Labels only populate after permission is granted
+      if(mics.every(m => !m.label)){
+        const s = await navigator.mediaDevices.getUserMedia({ audio:true });
+        s.getTracks().forEach(t => t.stop());
+        devices = await navigator.mediaDevices.enumerateDevices();
+        setAvailableMics(devices.filter(d => d.kind === "audioinput"));
       } else {
         setAvailableMics(mics);
       }
-    } catch(e){ setAvailableMics([]); }
+    } catch(e) { setAvailableMics([]); }
   };
 
   // ── Alt+D keyboard shortcut ───────────────────────────────────────────────
-  useEffect(()=>{
+  useEffect(() => {
     const handler = (e) => {
-      if(e.altKey && e.key.toLowerCase()==="d"){
+      if(e.altKey && e.key.toLowerCase() === "d"){
         e.preventDefault();
         const target = lastFocusRef.current ||
-          (inputMode==="structured" ? SF[0].key : "findings");
+          (inputMode === "structured" ? SF[0].key : "findings");
         toggleDictation(target);
       }
     };
@@ -1444,8 +1439,8 @@ Text: ${text}`}],
     return () => window.removeEventListener("keydown", handler);
   }, [dictatingField, inputMode]);
 
-  // Stop dictation when leaving dictate phase
-  useEffect(()=>{
+  // Stop dictation when leaving the dictate phase
+  useEffect(() => {
     if(phase !== "dictate") stopDictation();
   }, [phase]);
 

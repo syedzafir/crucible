@@ -1,76 +1,61 @@
 /**
- * Netlify serverless function: /api/deepgram-token
+ * /api/deepgram-token — Netlify serverless function
  *
- * Issues a short-lived Deepgram API key (TTL: 10 seconds) so the browser
- * can open a WebSocket directly to Deepgram without ever seeing your
- * real API key.
+ * Returns the Deepgram API key to the browser so it can authenticate
+ * a WebSocket connection. The key never touches frontend source code.
  *
- * Required Netlify environment variable:
- *   DEEPGRAM_API_KEY  — your Deepgram API key (starts with "Token ")
+ * HOW TO SET THE KEY IN NETLIFY:
+ *   Site configuration → Environment variables → Add variable
+ *   Key:   DEEPGRAM_API_KEY
+ *   Value: your key from console.deepgram.com
+ *          IMPORTANT: paste ONLY the raw key — do NOT include "Token "
+ *          ✓  abc123xyz...
+ *          ✗  Token abc123xyz...
  *
- * Get your key at: https://console.deepgram.com
- * Sign up is free. Nova-2-Medical model is pay-as-you-go (~$0.004/min).
+ * After adding the key, trigger a redeploy:
+ *   Deploys → Trigger deploy → Deploy site
  */
 export default async (request) => {
-  if (request.method !== "POST") {
+  if(request.method === "OPTIONS"){
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin":  "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      },
+    });
+  }
+  if(request.method !== "POST"){
     return new Response("Method not allowed", { status: 405 });
   }
 
-  const apiKey = process.env.DEEPGRAM_API_KEY;
-  if (!apiKey) {
+  let key = (process.env.DEEPGRAM_API_KEY || "").trim();
+
+  if(!key){
+    console.error("[Crucible] DEEPGRAM_API_KEY is not set in Netlify environment variables");
     return new Response(
-      JSON.stringify({ error: "DEEPGRAM_API_KEY not configured in Netlify environment variables" }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
+      JSON.stringify({ error: "DEEPGRAM_API_KEY not configured. Add it in Netlify → Site configuration → Environment variables." }),
+      { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
     );
   }
 
-  try {
-    // Create a temporary key via Deepgram's Keys API
-    // TTL of 10s is enough to open the WebSocket — connection stays alive after that
-    const resp = await fetch(
-      "https://api.deepgram.com/v1/projects/temp/keys",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Token ${apiKey}`,
-          "Content-Type":  "application/json",
-        },
-        body: JSON.stringify({
-          comment:     "Crucible dictation session",
-          scopes:      ["usage:write"],
-          time_to_live_in_seconds: 10,
-        }),
-      }
-    );
+  // Strip accidental "Token " prefix
+  key = key.replace(/^Token\s+/i, "").trim();
 
-    // If temp key creation fails (e.g. project ID issue), fall back to
-    // returning the real key with a short-circuit — still safer than
-    // hardcoding in the frontend, and acceptable for initial testing.
-    if (!resp.ok) {
-      console.warn("[Crucible] Deepgram temp key failed, using direct key for this session");
-      return new Response(
-        JSON.stringify({ key: apiKey }),
-        { status: 200, headers: { "Content-Type": "application/json",
-                                   "Access-Control-Allow-Origin": "*" } }
-      );
-    }
-
-    const data = await resp.json();
+  // Basic sanity check — Deepgram keys are long alphanumeric strings
+  if(key.length < 20){
+    console.error("[Crucible] DEEPGRAM_API_KEY looks malformed (too short)");
     return new Response(
-      JSON.stringify({ key: data.key }),
-      { status: 200, headers: { "Content-Type": "application/json",
-                                 "Access-Control-Allow-Origin": "*" } }
-    );
-
-  } catch (err) {
-    // Network error reaching Deepgram — return key directly as fallback
-    console.warn("[Crucible] Deepgram token endpoint unreachable:", err.message);
-    return new Response(
-      JSON.stringify({ key: apiKey }),
-      { status: 200, headers: { "Content-Type": "application/json",
-                                 "Access-Control-Allow-Origin": "*" } }
+      JSON.stringify({ error: "DEEPGRAM_API_KEY looks malformed. Check the value in Netlify environment variables." }),
+      { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
     );
   }
+
+  return new Response(
+    JSON.stringify({ key }),
+    { status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+  );
 };
 
 export const config = { path: "/api/deepgram-token" };
