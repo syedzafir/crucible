@@ -1266,152 +1266,19 @@ export default function Crucible(){
 
     // ── Step 4: Open Deepgram WebSocket ───────────────────────────────────────
     // Nova-2 Medical model — best accuracy for radiology terminology
-    // Radiology keyterms — 366 terms covering chest radiology comprehensively.
-    // Submitted as repeated keyterm params to Deepgram for vocabulary boosting.
-    // Organized by category — expand per modality as Crucible grows.
-    const KEYTERMS = [
-      // Airspace / Parenchyma
-      "consolidation","airspace opacity","airspace opacities",
-      "ground glass opacity","ground glass opacities","ground-glass",
-      "infiltrate","infiltrates","infiltration",
-      "atelectasis","subsegmental atelectasis","plate-like atelectasis",
-      "collapse","lobar collapse",
-      "pneumonia","lobar pneumonia","bronchopneumonia","aspiration pneumonia",
-      "abscess","lung abscess","cavitation","cavitary lesion",
-      "emphysema","centrilobular emphysema","panlobular emphysema","bullae","bulla",
-      "hyperinflation","air trapping",
-      "bronchiectasis","cylindrical bronchiectasis","cystic bronchiectasis",
-      "bronchiolitis","tree-in-bud",
-      "interstitial","interstitial markings","interstitial pattern",
-      "reticular","reticular pattern","reticulation",
-      "nodular","nodularity","honeycombing",
-      "fibrosis","pulmonary fibrosis","interstitial fibrosis",
-      "usual interstitial pneumonia","UIP",
-      "nonspecific interstitial pneumonia","NSIP",
-      "mosaic attenuation",
-      "air bronchogram","air bronchograms","silhouette sign",
-      "lucency","lucencies","hyperlucency",
-      "opacity","opacities","haziness",
-      // Nodules and Masses
-      "nodule","nodules","pulmonary nodule","pulmonary nodules",
-      "mass","masses","pulmonary mass","lesion","lesions",
-      "spiculated","spiculated margin","lobulated","lobulated margin",
-      "calcified nodule","calcification","calcifications",
-      "satellite nodule","coin lesion","solitary pulmonary nodule",
-      "ground glass nodule","part-solid nodule","subsolid nodule",
-      // Pleural
-      "pleural effusion","pleural effusions",
-      "right pleural effusion","left pleural effusion",
-      "bilateral pleural effusions","small pleural effusion",
-      "moderate pleural effusion","large pleural effusion",
-      "parapneumonic effusion","empyema","hemothorax",
-      "pneumothorax","tension pneumothorax","small pneumothorax",
-      "hydropneumothorax","pleural thickening","pleural calcification",
-      "pleural plaque","pleural plaques","mesothelioma",
-      "costophrenic angle","costophrenic angles","costophrenic blunting",
-      "blunted costophrenic angle",
-      "hemidiaphragm","right hemidiaphragm","left hemidiaphragm",
-      "diaphragm","diaphragmatic","subpulmonic",
-      // Cardiac and Mediastinal
-      "cardiomegaly","mild cardiomegaly","moderate cardiomegaly",
-      "cardiomediastinal silhouette","cardiothoracic ratio","cardiac enlargement",
-      "pericardial effusion","pericardium",
-      "pulmonary vascular congestion","vascular congestion",
-      "pulmonary venous hypertension","pulmonary edema",
-      "interstitial pulmonary edema","alveolar pulmonary edema",
-      "Kerley B lines","Kerley lines",
-      "mediastinum","mediastinal","mediastinal widening",
-      "superior mediastinum","anterior mediastinum","posterior mediastinum",
-      "mediastinal mass","mediastinal lymphadenopathy",
-      "aorta","aortic","aortic knuckle","aortic knob",
-      "aortic arch","thoracic aorta","aortic unfolding","tortuous aorta",
-      "aortic dissection","vascular pedicle",
-      "trachea","tracheal deviation","tracheal shift",
-      "carina","carinal angle","subcarina",
-      "paratracheal","right paratracheal","left paratracheal",
-      "aortopulmonary window","retrosternal","retrocardiac",
-      // Hila
-      "hilum","hila","hilar","right hilum","left hilum",
-      "hilar enlargement","hilar prominence","hilar lymphadenopathy",
-      "hilar mass","perihilar",
-      // Vascular
-      "pulmonary embolism","pulmonary emboli",
-      "pulmonary artery","pulmonary arteries",
-      "pulmonary vasculature","pulmonary vascularity","vascular markings",
-      "prominent pulmonary artery","Westermark sign",
-      // Osseous and Soft Tissue
-      "rib","ribs","rib fracture","rib fractures","acute rib fracture",
-      "healing rib fracture","clavicle","clavicles","scapula","scapulae",
-      "humerus","sternum","sternal",
-      "vertebra","vertebrae","vertebral body","vertebral bodies",
-      "spondylosis","degenerative changes","osteophyte","osteophytes",
-      "compression fracture","vertebral compression fracture",
-      "lytic","lytic lesion","lytic lesions",
-      "sclerotic","sclerotic lesion","periosteal reaction",
-      "bone density","osteopenia","osteoporosis",
-      "soft tissue","soft tissues","subcutaneous","subcutaneous emphysema",
-      "surgical emphysema",
-      // Lines, Tubes and Devices
-      "endotracheal tube","ETT","nasogastric tube","NG tube","NGT",
-      "central venous catheter","CVC","PICC line",
-      "peripherally inserted central catheter",
-      "Swan-Ganz catheter","pulmonary artery catheter",
-      "chest tube","chest drain","pacemaker","pacemaker lead","pacemaker leads",
-      "ICD","implantable cardioverter defibrillator","cardiac device",
-      "port-a-cath","implanted port","aortic stent","aortic stent graft",
-      "coronary stent","surgical clips","surgical staples","tracheostomy tube",
-      // Subdiaphragmatic
-      "free air","free subdiaphragmatic air","pneumoperitoneum",
-      "subdiaphragmatic","bowel gas","bowel gas pattern","gastric bubble",
-      "liver","hepatic","spleen","splenic",
-      // Anatomical Locations
-      "right upper lobe","RUL","right middle lobe","RML",
-      "right lower lobe","RLL","left upper lobe","LUL",
-      "left lower lobe","LLL","lingula","lingular",
-      "apical","apex","apices","basal","base","bases",
-      "subpleural","peripheral","central",
-      "bilateral","bilaterally","unilateral","unilaterally",
-      "ipsilateral","contralateral","right-sided","left-sided",
-      // Descriptors
-      "unremarkable","within normal limits","no significant","no acute",
-      "no evidence","compatible with","consistent with","in keeping with",
-      "cannot be excluded","clinical correlation","compared with",
-      "interval change","interval development","interval improvement",
-      "interval worsening","unchanged","stable","improved","worsened","new",
-      "subtle","mild","moderate","severe","small","large",
-      "homogeneous","heterogeneous","well-defined","ill-defined",
-      "poorly defined","sharply marginated",
-      "acute","chronic","subacute","focal","diffuse","multifocal",
-      "patchy","confluent","adjacent","associated",
-      "posterior","anterior","lateral","medial","superior","inferior",
-      "dependent","nondependent",
-      // Report structure
-      "impression","findings","technique","indication","comparison",
-      "clinical correlation recommended","follow-up recommended",
-      "further evaluation","radiograph","radiographs","chest radiograph",
-      "chest X-ray","PA and lateral","posteroanterior",
-      "portable","AP view","anteroposterior",
-      // Diagnoses
-      "community-acquired pneumonia","hospital-acquired pneumonia","COVID-19",
-      "congestive heart failure","CHF","COPD",
-      "chronic obstructive pulmonary disease","lung cancer",
-      "bronchogenic carcinoma","metastases","metastasis","metastatic disease",
-      "lymphoma","sarcoidosis","tuberculosis","TB","aspergillosis",
-      "Pneumocystis","PCP",
-    ];
-
+    // Note: keyterms are NOT passed as URL params — 367 terms makes the URL
+    // too long for Deepgram's WebSocket handshake (>8KB limit).
+    // Instead, Haiku Fix Terms provides post-correction of medical vocabulary.
     const params = new URLSearchParams({
-      model:              "nova-2",   // nova-2 works on all Deepgram tiers
-      language:           "en-US",
-      smart_format:       "true",
-      interim_results:    "true",
-      utterance_end_ms:   "800",    // slightly faster finalisation
-      encoding:           "linear16",
-      sample_rate:        "16000",
-      channels:           "1",
+      model:           "nova-2",   // nova-2 available on all Deepgram tiers
+      language:        "en-US",
+      smart_format:    "true",     // auto punctuation + capitalisation
+      interim_results: "true",     // live words as you speak
+      utterance_end_ms:"800",      // finalise after 0.8s silence
+      encoding:        "linear16",
+      sample_rate:     "16000",
+      channels:        "1",
     });
-    // Append each keyterm individually (Deepgram expects repeated params)
-    KEYTERMS.forEach(t => params.append("keyterm", t));
     // Auth via subprotocol — this is Deepgram's current required method.
     // access_token as a URL param is deprecated and will be rejected.
     const ws = new WebSocket(
@@ -1491,15 +1358,24 @@ export default function Crucible(){
       }
     };
 
-    ws.onerror = () => {
-      setApiError("Deepgram connection error — check your internet connection.");
-      stopDictation();
+    ws.onerror = (e) => {
+      console.error("[Crucible] Deepgram WebSocket error:", e);
     };
 
     ws.onclose = (e) => {
-      // Code 1000 = clean close, anything else is unexpected
-      if(e.code !== 1000 && dictFieldRef.current){
-        setApiError("Dictation disconnected unexpectedly (code " + e.code + "). Tap mic to restart.");
+      console.log("[Crucible] WebSocket closed — code:", e.code, "reason:", e.reason);
+      if(!dictFieldRef.current) return; // clean stop, ignore
+      if(e.code === 1000){
+        // Normal close — no error
+      } else if(e.code === 1008 || e.code === 4001 || e.code === 4002){
+        setApiError("Deepgram authentication failed — check DEEPGRAM_API_KEY is set correctly in Netlify environment variables.");
+        stopDictation();
+      } else if(e.code === 1006){
+        // Abnormal close — usually auth rejection on connect
+        setApiError("Deepgram rejected the connection. Check: (1) DEEPGRAM_API_KEY is set in Netlify environment variables, (2) the Netlify function deployed successfully.");
+        stopDictation();
+      } else {
+        setApiError("Dictation disconnected (code " + e.code + (e.reason ? ": " + e.reason : "") + "). Tap mic to retry.");
         stopDictation();
       }
     };
