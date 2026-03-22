@@ -1144,9 +1144,9 @@ export default function Crucible(){
   const [apiError,     setApiError]    = useState(null);
 
   // ── Dictation state ─────────────────────────────────────────────────────────
-  // Deepgram Nova-2 Medical — WebSocket streaming for near-instant transcription.
+  // Deepgram Nova-2 — WebSocket streaming for near-instant transcription.
   // Flow:
-  //   1. startDictation() → fetches a short-lived token from /api/deepgram-token
+  //   1. startDictation() reads VITE_DEEPGRAM_API_KEY (baked in at Vite build time)
   //   2. Opens a WebSocket to wss://api.deepgram.com/v1/listen
   //   3. getUserMedia audio streams into the WebSocket as raw PCM
   //   4. Deepgram sends back interim (live) + final transcripts
@@ -1222,16 +1222,12 @@ export default function Crucible(){
     // Stop any existing session
     if(dictFieldRef.current) stopDictation();
 
-    // ── Step 1: Get a short-lived Deepgram token from our serverless function ──
-    let token;
-    try {
-      const resp = await fetch("/api/deepgram-token", { method:"POST" });
-      if(!resp.ok) throw new Error(`Token error ${resp.status}`);
-      const data = await resp.json();
-      token = data.key;
-      if(!token) throw new Error("No token returned");
-    } catch(err) {
-      setApiError("Could not start dictation — check DEEPGRAM_API_KEY is set in Netlify environment variables. (" + err.message + ")");
+    // ── Step 1: Get Deepgram API key (baked in at build time via Vite) ──────────
+    // Key is set as VITE_DEEPGRAM_API_KEY in Netlify environment variables.
+    // Vite replaces import.meta.env.VITE_DEEPGRAM_API_KEY at build time.
+    const token = import.meta.env.VITE_DEEPGRAM_API_KEY;
+    if(!token){
+      setApiError("Deepgram API key not found. Add VITE_DEEPGRAM_API_KEY to Netlify environment variables and redeploy.");
       return;
     }
 
@@ -1279,11 +1275,11 @@ export default function Crucible(){
       sample_rate:     "16000",
       channels:        "1",
     });
-    // Auth via subprotocol — this is Deepgram's current required method.
-    // access_token as a URL param is deprecated and will be rejected.
+    // Auth: token in URL — most reliable method from browser environments.
+    // The key is baked into the build via VITE_, not sent from a server.
+    params.set("access_token", token);
     const ws = new WebSocket(
-      `wss://api.deepgram.com/v1/listen?${params}`,
-      ["token", token]   // ← token passed as WebSocket subprotocol
+      `wss://api.deepgram.com/v1/listen?${params}`
     );
     wsRef.current = ws;
 
