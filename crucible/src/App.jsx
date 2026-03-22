@@ -96,7 +96,7 @@ function structuredToFree(fields) {
 // Free → Guided: Claude Haiku parses free text into anatomical fields
 async function parseToStructured(findings, impression, onComplete, onError) {
   try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    const resp = await fetch("/api/messages", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
@@ -256,7 +256,7 @@ Return ONLY valid JSON, no markdown:
 // in sandboxed browser environments where TCP close signals are unpredictable.
 async function evaluateReport(prompt, onComplete, onError) {
   try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    const resp = await fetch("/api/messages", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
@@ -1143,27 +1143,38 @@ export default function Crucible(){
   const [verbosity,    setVerbosity]   = useState("succinct");
   const [apiError,     setApiError]    = useState(null);
 
-  // ── Dictation state ──────────────────────────────────────────────────────────
+  // ── Dictation state ─────────────────────────────────────────────────────────
+  // Deepgram Nova-2 Medical — WebSocket streaming for near-instant transcription.
+  // Flow:
+  //   1. startDictation() → fetches a short-lived token from /api/deepgram-token
+  //   2. Opens a WebSocket to wss://api.deepgram.com/v1/listen
+  //   3. getUserMedia audio streams into the WebSocket as raw PCM
+  //   4. Deepgram sends back interim (live) + final transcripts
+  //   5. Interim words appear immediately; final words are locked in
+  //   6. stopDictation() closes the socket and releases the mic
+
   const [dictatingField, setDictatingField] = useState(null);
   const [fixableFields,  setFixableFields]  = useState(new Set());
   const [fixingField,    setFixingField]    = useState(null);
   const [availableMics,  setAvailableMics]  = useState([]);
-  const [selectedMicId,  setSelectedMicId]  = useState("");    // "" = system default
+  const [selectedMicId,  setSelectedMicId]  = useState("");
   const [showMicSelector,setShowMicSelector]= useState(false);
-  const [showReview,   setShowReview]   = useState(false);
-  const [showReport,   setShowReport]   = useState(false);
-  const [reviewQueue,  setReviewQueue]  = useState([]);
-  const [rubricMeta,   setRubricMeta]   = useState(INITIAL_RUBRIC_META);
-  // ── Deepgram Medical Dictation ──────────────────────────────────────────────
-  // Uses MediaRecorder to capture audio in chunks, sends each chunk to our
-  // Netlify serverless proxy which forwards to Deepgram Nova-2 Medical.
-  // No Google dependency — works on any network including VPN.
+  const [showReview,     setShowReview]     = useState(false);
+  const [showReport,     setShowReport]     = useState(false);
+  const [reviewQueue,    setReviewQueue]    = useState([]);
+  const [rubricMeta,     setRubricMeta]     = useState(INITIAL_RUBRIC_META);
+  const [interimText,    setInterimText]    = useState("");  // live words not yet final
 
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef   = useRef([]);
-  const dictFieldRef     = useRef(null);
-  const lastFocusRef     = useRef(null);
+  const wsRef          = useRef(null);   // Deepgram WebSocket
+  const mediaStreamRef = useRef(null);   // getUserMedia stream
+  const processorRef   = useRef(null);   // AudioWorkletNode / ScriptProcessorNode
+  const audioCtxRef    = useRef(null);   // AudioContext
+  const dictFieldRef   = useRef(null);   // active field id (stable across closures)
+  const finalTextRef   = useRef("");     // all finalised text this session
+  const baseTextRef    = useRef("");     // text in field before session started
+  const lastFocusRef   = useRef(null);
 
+  // ── Stable value/setter helpers ───────────────────────────────────────────
   const getFieldValue = (id) => {
     if(id==="findings")   return findings;
     if(id==="impression") return impression;
@@ -1176,58 +1187,67 @@ export default function Crucible(){
     setSfFields(prev=>({...prev,[id]:val}));
   };
 
-  // Send accumulated audio to Deepgram via our serverless proxy
-  const transcribeChunks = async (chunks, fieldId, baseText) => {
-    if(!chunks.length) return;
-    const blob = new Blob(chunks, { type:"audio/webm" });
-    try {
-      const resp = await fetch("/api/deepgram", {
-        method:  "POST",
-        headers: { "Content-Type":"audio/webm" },
-        body:    blob,
-      });
-      if(!resp.ok) throw new Error(`Deepgram error ${resp.status}`);
-      const data = await resp.json();
-      const transcript = data?.results?.channels?.[0]
-        ?.alternatives?.[0]?.transcript || "";
-      if(transcript.trim()){
-        const sep = baseText && !baseText.endsWith(" ") &&
-                    !baseText.endsWith("\n") ? " " : "";
-        setFieldValue(fieldId, baseText + sep + transcript);
-      }
-    } catch(err){
-      console.log("[Crucible] Deepgram transcription error:", err.message);
-      setApiError("Transcription failed: " + err.message);
-    }
-  };
-
+  // ── Core dictation functions ──────────────────────────────────────────────
   const stopDictation = () => {
-    if(mediaRecorderRef.current &&
-       mediaRecorderRef.current.state !== "inactive"){
-      mediaRecorderRef.current.stop();
+    // Close WebSocket cleanly
+    if(wsRef.current){
+      try{ wsRef.current.close(); }catch(e){}
+      wsRef.current = null;
     }
-    mediaRecorderRef.current = null;
+    // Disconnect audio graph
+    if(processorRef.current){
+      try{ processorRef.current.disconnect(); }catch(e){}
+      processorRef.current = null;
+    }
+    if(audioCtxRef.current){
+      try{ audioCtxRef.current.close(); }catch(e){}
+      audioCtxRef.current = null;
+    }
+    // Release microphone
+    if(mediaStreamRef.current){
+      mediaStreamRef.current.getTracks().forEach(t=>t.stop());
+      mediaStreamRef.current = null;
+    }
+    // Mark field as fixable if something was dictated
     const fld = dictFieldRef.current;
-    if(fld) setFixableFields(prev=>new Set([...prev, fld]));
+    if(fld && finalTextRef.current.trim()){
+      setFixableFields(prev=>new Set([...prev, fld]));
+    }
     dictFieldRef.current = null;
     setDictatingField(null);
+    setInterimText("");
   };
 
   const startDictation = async (fieldId) => {
-    // Stop any running session first
+    // Stop any existing session
     if(dictFieldRef.current) stopDictation();
 
-    // Request microphone access
+    // ── Step 1: Get a short-lived Deepgram token from our serverless function ──
+    let token;
+    try {
+      const resp = await fetch("/api/deepgram-token", { method:"POST" });
+      if(!resp.ok) throw new Error(`Token error ${resp.status}`);
+      const data = await resp.json();
+      token = data.key;
+      if(!token) throw new Error("No token returned");
+    } catch(err) {
+      setApiError("Could not start dictation — check DEEPGRAM_API_KEY is set in Netlify environment variables. (" + err.message + ")");
+      return;
+    }
+
+    // ── Step 2: Request microphone ────────────────────────────────────────────
     let stream;
     try {
-      const constraints = { audio: selectedMicId
-        ? { deviceId:{ exact: selectedMicId } }
-        : true };
+      const constraints = {
+        audio: selectedMicId
+          ? { deviceId:{ exact:selectedMicId }, sampleRate:16000, channelCount:1 }
+          : { sampleRate:16000, channelCount:1 }
+      };
       stream = await navigator.mediaDevices.getUserMedia(constraints);
-    } catch(err){
-      if(err.name === "NotAllowedError"){
+    } catch(err) {
+      if(err.name==="NotAllowedError"){
         setApiError("Microphone permission denied — please allow microphone access for this site in your browser settings.");
-      } else if(err.name === "NotFoundError"){
+      } else if(err.name==="NotFoundError"){
         setApiError("No microphone found — please connect a microphone and try again.");
       } else {
         setApiError("Could not access microphone: " + err.message);
@@ -1235,83 +1255,114 @@ export default function Crucible(){
       return;
     }
 
-    const baseText = getFieldValue(fieldId);
+    mediaStreamRef.current = stream;
+
+    // ── Step 3: Set up state for this session ─────────────────────────────────
+    baseTextRef.current  = getFieldValue(fieldId);
+    finalTextRef.current = "";
     dictFieldRef.current = fieldId;
     setDictatingField(fieldId);
-    audioChunksRef.current = [];
+    setInterimText("");
 
-    // Set up MediaRecorder — sends audio every 3 seconds for near-real-time feel
-    let recorder;
-    try {
-      recorder = new MediaRecorder(stream, { mimeType:"audio/webm" });
-    } catch(e){
-      // Fallback if audio/webm not supported
-      recorder = new MediaRecorder(stream);
-    }
-    mediaRecorderRef.current = recorder;
+    // ── Step 4: Open Deepgram WebSocket ───────────────────────────────────────
+    // Nova-2 Medical model — best accuracy for radiology terminology
+    const params = new URLSearchParams({
+      model:              "nova-2-medical",
+      language:           "en-US",
+      smart_format:       "true",   // punctuation, capitalisation
+      interim_results:    "true",   // live words as you speak
+      utterance_end_ms:   "1000",   // finalise after 1s silence
+      encoding:           "linear16",
+      sample_rate:        "16000",
+      channels:           "1",
+    });
+    const ws = new WebSocket(
+      `wss://api.deepgram.com/v1/listen?${params}`,
+      ["token", token]
+    );
+    wsRef.current = ws;
 
-    // Accumulate the full transcript as we go
-    let accumulatedText = baseText;
+    ws.onopen = () => {
+      // ── Step 5: Pipe mic audio into WebSocket as raw PCM (linear16) ─────────
+      const audioCtx = new AudioContext({ sampleRate:16000 });
+      audioCtxRef.current = audioCtx;
+      const source  = audioCtx.createMediaStreamSource(stream);
 
-    recorder.ondataavailable = async (e) => {
-      console.log("[Crucible] chunk received, size:", e.data.size, "type:", recorder.mimeType);
-      if(e.data.size < 100) {
-        console.log("[Crucible] chunk too small, skipping");
-        return;
+      // ScriptProcessorNode — widely supported fallback
+      // (AudioWorklet is better but requires a separate .js file)
+      const bufferSize = 4096;
+      const processor  = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        if(!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+        const float32 = e.inputBuffer.getChannelData(0);
+        // Convert Float32 → Int16 PCM
+        const int16 = new Int16Array(float32.length);
+        for(let i=0; i<float32.length; i++){
+          int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+        }
+        wsRef.current.send(int16.buffer);
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+    };
+
+    // ── Step 6: Handle incoming transcripts ───────────────────────────────────
+    ws.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch{ return; }
+      if(msg.type !== "Results") return;
+
+      const alt      = msg.channel?.alternatives?.[0];
+      const text     = alt?.transcript || "";
+      const isFinal  = msg.is_final;
+
+      if(!text) return;
+
+      if(isFinal){
+        // Lock this transcript in permanently
+        const sep = finalTextRef.current &&
+          !finalTextRef.current.endsWith(" ") &&
+          !finalTextRef.current.endsWith("\n") ? " " : "";
+        finalTextRef.current += sep + text;
+        setInterimText("");
+      } else {
+        // Show live interim words (will be overwritten or finalised)
+        setInterimText(text);
       }
-      const blob = new Blob([e.data], { type: recorder.mimeType });
-      try {
-        console.log("[Crucible] Sending to /api/deepgram…");
-        const resp = await fetch("/api/deepgram", {
-          method:  "POST",
-          headers: { "Content-Type": recorder.mimeType },
-          body:    blob,
-        });
-        console.log("[Crucible] Deepgram response status:", resp.status);
-        const data = await resp.json();
-        console.log("[Crucible] Deepgram response:", JSON.stringify(data).slice(0,200));
 
-        if(!resp.ok){
-          // Show error in UI so user can see it without opening console
-          const errMsg = data?.err_msg || data?.error || `Error ${resp.status}`;
-          setApiError("Deepgram error: " + errMsg);
-          return;
-        }
-
-        const t = data?.results?.channels?.[0]
-          ?.alternatives?.[0]?.transcript || "";
-        console.log("[Crucible] Transcript:", t);
-
-        if(t.trim()){
-          const sep = accumulatedText &&
-            !accumulatedText.endsWith(" ") &&
-            !accumulatedText.endsWith("\n") ? " " : "";
-          accumulatedText = accumulatedText + sep + t;
-          if(dictFieldRef.current === fieldId){
-            setFieldValue(fieldId, accumulatedText);
-          }
-        } else {
-          console.log("[Crucible] No transcript in response (silence or unrecognised audio)");
-        }
-      } catch(err){
-        console.log("[Crucible] fetch error:", err.message);
-        setApiError("Dictation network error: " + err.message);
+      // Update the field: base + all finals + current interim
+      if(dictFieldRef.current === fieldId){
+        const base    = baseTextRef.current;
+        const finals  = finalTextRef.current;
+        const interim = isFinal ? "" : text;
+        const sep     = (base && finals) && !base.endsWith(" ") &&
+                        !base.endsWith("\n") ? " " : "";
+        const interimSep = (base||finals) && interim &&
+                           !(finals||base).endsWith(" ") ? " " : "";
+        setFieldValue(
+          fieldId,
+          base +
+          (finals ? sep + finals : "") +
+          (interim ? interimSep + interim : "")
+        );
       }
     };
 
-    recorder.onstop = () => {
-      // Stop all microphone tracks to release the mic indicator in browser
-      stream.getTracks().forEach(t => t.stop());
-    };
-
-    recorder.onerror = (e) => {
-      console.log("[Crucible] MediaRecorder error:", e);
+    ws.onerror = () => {
+      setApiError("Deepgram connection error — check your internet connection.");
       stopDictation();
     };
 
-    // Fire ondataavailable every 3 seconds while recording
-    recorder.start(3000);
-    console.log("[Crucible] Deepgram recording started for field:", fieldId);
+    ws.onclose = (e) => {
+      // Code 1000 = clean close, anything else is unexpected
+      if(e.code !== 1000 && dictFieldRef.current){
+        setApiError("Dictation disconnected unexpectedly (code " + e.code + "). Tap mic to restart.");
+        stopDictation();
+      }
+    };
   };
 
   const toggleDictation = (fieldId) => {
@@ -1319,7 +1370,7 @@ export default function Crucible(){
     else startDictation(fieldId);
   };
 
-  // Fix medical terms for a field via Claude Haiku (second-pass correction)
+  // ── Fix Terms (Haiku post-correction pass) ────────────────────────────────
   const fixTerms = async (fieldId) => {
     const text = getFieldValue(fieldId);
     if(!text.trim()) return;
@@ -1349,15 +1400,15 @@ Text: ${text}`}],
     setFixableFields(prev=>{ const n=new Set(prev); n.delete(fieldId); return n; });
   };
 
-  // Load available microphones
+  // ── Load available microphones ────────────────────────────────────────────
   const loadMics = async () => {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
-      const mics = devices.filter(d=>d.kind==="audioinput");
+      const mics    = devices.filter(d=>d.kind==="audioinput");
       if(mics.every(m=>!m.label)){
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({audio:true});
-          stream.getTracks().forEach(t=>t.stop());
+          const s = await navigator.mediaDevices.getUserMedia({audio:true});
+          s.getTracks().forEach(t=>t.stop());
           const refreshed = await navigator.mediaDevices.enumerateDevices();
           setAvailableMics(refreshed.filter(d=>d.kind==="audioinput"));
         } catch(e){ setAvailableMics(mics); }
@@ -1367,7 +1418,7 @@ Text: ${text}`}],
     } catch(e){ setAvailableMics([]); }
   };
 
-  // Alt+D keyboard shortcut
+  // ── Alt+D keyboard shortcut ───────────────────────────────────────────────
   useEffect(()=>{
     const handler = (e) => {
       if(e.altKey && e.key.toLowerCase()==="d"){
@@ -1734,61 +1785,19 @@ Text: ${text}`}],
               ))}
 
               {apiError&&(
-                apiError==="__iframe__"
-                ? (
-                  <div style={{margin:"14px 0 0",padding:"12px 14px",borderRadius:6,
-                    background:"rgba(93,168,160,0.07)",border:`1px solid ${A_BD}`,
-                    fontSize:12,lineHeight:1.75}}>
-                    <div style={{fontWeight:700,color:A,marginBottom:6,fontSize:13}}>
-                      🎙 Voice Dictation — Preview Limitation
-                    </div>
-                    <div style={{color:T3,marginBottom:8}}>
-                      Microphone access is blocked in this preview sandbox.
-                      The code is ready — dictation will work in your deployed app.
-                    </div>
-                    <div style={{color:T2,fontWeight:600,marginBottom:4}}>
-                      Use OS dictation to test right now:
-                    </div>
-                    <div style={{display:"flex",flexDirection:"column",gap:4}}>
-                      {[
-                        {os:"Mac",     key:"Fn + Fn  (or mic key)", color:"#9ab8c8"},
-                        {os:"Windows", key:"Win + H",               color:"#9ab8c8"},
-                        {os:"ChromeOS",key:"Search + D",            color:"#9ab8c8"},
-                      ].map(({os,key,color})=>(
-                        <div key={os} style={{display:"flex",gap:8,alignItems:"baseline"}}>
-                          <span style={{fontSize:11,fontWeight:700,color:T4,
-                            width:64,flexShrink:0}}>{os}</span>
-                          <span style={{fontFamily:MONO,fontSize:11,
-                            padding:"1px 7px",borderRadius:3,
-                            background:"#080f18",border:"1px solid #0e1c2c",
-                            color:color}}>{key}</span>
-                        </div>
-                      ))}
-                    </div>
-                    <button onClick={()=>setApiError(null)}
-                      style={{marginTop:10,fontSize:11,color:T5,background:"transparent",
-                        border:"none",cursor:"pointer",fontFamily:FF,padding:0,
-                        textDecoration:"underline",textUnderlineOffset:2}}>
-                      Dismiss
-                    </button>
-                  </div>
-                )
-                : (
-                  <div style={{margin:"14px 0 0",padding:"10px 13px",borderRadius:5,
-                    background:"rgba(180,60,60,0.1)",border:"1px solid rgba(180,60,60,0.3)",
-                    fontSize:13,color:"#c07070",lineHeight:1.6}}>
-                    ⚠ {apiError}
-                    <button onClick={()=>setApiError(null)}
-                      style={{marginLeft:10,fontSize:11,color:"#c07070",background:"transparent",
-                        border:"none",cursor:"pointer",fontFamily:FF,
-                        textDecoration:"underline",textUnderlineOffset:2}}>
-                      Dismiss
-                    </button>
-                  </div>
-                )
+                <div style={{margin:"14px 0 0",padding:"10px 13px",borderRadius:5,
+                  background:"rgba(180,60,60,0.1)",border:"1px solid rgba(180,60,60,0.3)",
+                  fontSize:13,color:"#c07070",lineHeight:1.6}}>
+                  ⚠ {apiError}
+                  <button onClick={()=>setApiError(null)}
+                    style={{marginLeft:10,fontSize:11,color:"#c07070",background:"transparent",
+                      border:"none",cursor:"pointer",fontFamily:FF,
+                      textDecoration:"underline",textUnderlineOffset:2}}>
+                    Dismiss
+                  </button>
+                </div>
               )}
 
-              <div style={{height:1,background:"#0b1820",margin:"14px 0"}}/>
               <ModeToggle
                 mode={inputMode}
                 onChange={handleModeChange}
@@ -1821,13 +1830,17 @@ Text: ${text}`}],
                 alignItems:"center",marginBottom:9}}>
                 <div style={{fontFamily:MONO,fontSize:13,color:T5}}>⏱ {fmt(elapsed)}</div>
                 {dictatingField&&(
-                  <div style={{display:"flex",alignItems:"center",gap:5,
+                  <div style={{display:"flex",alignItems:"center",gap:6,
                     fontSize:12,color:"#f87171",fontWeight:600,
-                    animation:"micPulse 1.4s ease-in-out infinite"}}>
-                    <svg width="10" height="10" viewBox="0 0 10 10">
+                    animation:"micPulse 1.4s ease-in-out infinite",
+                    maxWidth:160,overflow:"hidden"}}>
+                    <svg width="8" height="8" viewBox="0 0 10 10" style={{flexShrink:0}}>
                       <circle cx="5" cy="5" r="4" fill="#f87171"/>
                     </svg>
-                    Listening
+                    <span style={{whiteSpace:"nowrap",overflow:"hidden",
+                      textOverflow:"ellipsis",opacity:interimText?1:0.7}}>
+                      {interimText || "Listening…"}
+                    </span>
                   </div>
                 )}
                 <div style={{fontSize:13,fontWeight:500,color:T5}}>

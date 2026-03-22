@@ -2,9 +2,6 @@
  * Netlify serverless function: /api/deepgram
  * Proxies audio to Deepgram Nova-2 Medical.
  * Set DEEPGRAM_API_KEY in Netlify Environment Variables.
- *
- * Deepgram Nova-2 Medical is trained on clinical vocabulary —
- * costophrenic, consolidation, bronchiectasis, etc. all recognised accurately.
  */
 export default async (request) => {
   if(request.method !== "POST"){
@@ -21,15 +18,20 @@ export default async (request) => {
 
   try {
     const audioBuffer = await request.arrayBuffer();
-    const contentType = request.headers.get("Content-Type") || "audio/webm";
 
-    // Deepgram Nova-2 Medical — best model for clinical/radiological language
+    // Strip codec from Content-Type — Deepgram rejects "audio/webm;codecs=opus"
+    const rawType    = request.headers.get("Content-Type") || "audio/webm";
+    const contentType = rawType.split(";")[0].trim();
+
     const url = new URL("https://api.deepgram.com/v1/listen");
-    url.searchParams.set("model",       "nova-2-medical");
+    url.searchParams.set("model",       "nova-2-medical"); // medical vocabulary
     url.searchParams.set("language",    "en-US");
-    url.searchParams.set("smart_format","true");  // auto punctuation + capitalisation
-    url.searchParams.set("numerals",    "true");  // speak numbers, get digits
-    url.searchParams.set("punctuate",   "true");
+    url.searchParams.set("punctuate",   "true");   // add punctuation
+    url.searchParams.set("numerals",    "true");   // speak numbers → digits
+    // smart_format OFF — causes unwanted mid-sentence capitalisation
+    // diarize OFF — single speaker dictation
+    url.searchParams.set("diarize",     "false");
+    url.searchParams.set("utterances",  "false");
 
     const upstream = await fetch(url.toString(), {
       method:  "POST",
