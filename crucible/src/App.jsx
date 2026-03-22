@@ -1136,6 +1136,54 @@ function ReviewQueue({ queue, rubricMeta, onClose, onResolve, onVersionBump }) {
   );
 }
 
+
+// ── LoadingPanel — shows escape-hatch button after 15s ────────────────────────
+function LoadingPanel({ onCancel }) {
+  const [showEscape, setShowEscape] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setShowEscape(true), 15000);
+    return () => clearTimeout(t);
+  }, []);
+  return (
+    <div style={{flex:1,display:"flex",flexDirection:"column",
+      alignItems:"center",justifyContent:"center",gap:24,padding:"0 28px"}}>
+      <div style={{width:44,height:44,borderRadius:"50%",
+        border:"2px solid #0d1c28",borderTop:`2px solid ${A}`,
+        animation:"spin 0.65s linear infinite"}}/>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:15,fontWeight:600,color:T3,marginBottom:5}}>
+          Analysing report
+        </div>
+        <div style={{fontSize:12,color:T5}}>
+          {showEscape ? "Taking longer than expected…" : "Claude Haiku · usually under 5 seconds"}
+        </div>
+      </div>
+      <div style={{width:"100%",height:3,borderRadius:2,background:"#0c1825",overflow:"hidden"}}>
+        <div style={{height:"100%",background:A,borderRadius:2,
+          animation:showEscape
+            ? "none"
+            : "loadBar 5s cubic-bezier(0.4,0,0.6,1) forwards",
+          width:showEscape?"93%":undefined}}/>
+      </div>
+      <div style={{fontSize:12,color:T5,textAlign:"center",lineHeight:2}}>
+        <div>Comparing against reference report</div>
+        <div>Applying rubric criteria</div>
+      </div>
+      {showEscape&&(
+        <button onClick={onCancel}
+          style={{marginTop:4,padding:"9px 22px",borderRadius:6,
+            border:"1px solid #1e3a4a",background:"transparent",
+            color:T3,fontFamily:FF,fontSize:13,fontWeight:500,
+            cursor:"pointer",transition:"all .2s"}}
+          onMouseOver={e=>{e.currentTarget.style.borderColor=A;e.currentTarget.style.color=A_LT;}}
+          onMouseOut={e=>{e.currentTarget.style.borderColor="#1e3a4a";e.currentTarget.style.color=T3;}}>
+          Cancel &amp; return to report
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function Crucible(){
   const [tool,         setTool]        = useState("window");
   const [series,       setSeries]      = useState(0);
@@ -1994,27 +2042,7 @@ Text: ${text}` }],
 
           {/* ── LOADING ── */}
           {phase==="loading"&&(
-            <div style={{flex:1,display:"flex",flexDirection:"column",
-              alignItems:"center",justifyContent:"center",gap:24,padding:"0 28px"}}>
-              <div style={{width:44,height:44,borderRadius:"50%",
-                border:"2px solid #0d1c28",borderTop:`2px solid ${A}`,
-                animation:"spin 0.65s linear infinite"}}/>
-              <div style={{textAlign:"center"}}>
-                <div style={{fontSize:15,fontWeight:600,color:T3,marginBottom:5}}>
-                  Analysing report
-                </div>
-                <div style={{fontSize:12,color:T5}}>Claude Haiku · usually under 2 seconds</div>
-              </div>
-              <div style={{width:"100%",height:3,borderRadius:2,
-                background:"#0c1825",overflow:"hidden"}}>
-                <div style={{height:"100%",background:A,borderRadius:2,
-                  animation:"loadBar 2.5s cubic-bezier(0.4,0,0.6,1) forwards"}}/>
-              </div>
-              <div style={{fontSize:12,color:T5,textAlign:"center",lineHeight:2}}>
-                <div>Comparing against reference report</div>
-                <div>Applying rubric criteria</div>
-              </div>
-            </div>
+            <LoadingPanel onCancel={()=>{ setPhase("dictate"); setApiError(null); }}/>
           )}
 
           {/* ── FEEDBACK ── */}

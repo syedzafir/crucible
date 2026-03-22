@@ -3,13 +3,27 @@
   publish   = "dist"
   functions = "netlify/functions"
 
-# Route /api/messages → Anthropic proxy function
+# Increase function timeout to 30 seconds (default is 10s — too short for AI calls)
+[functions]
+  node_bundler = "esbuild"
+
+[functions."api"]
+  timeout = 30
+
+[functions."deepgram-token"]
+  timeout = 10
+
+# Route all /api/* calls to their respective serverless functions
 [[redirects]]
   from   = "/api/messages"
   to     = "/.netlify/functions/api"
   status = 200
 
-# Route /api/deepgram → Deepgram proxy function  
+[[redirects]]
+  from   = "/api/deepgram-token"
+  to     = "/.netlify/functions/deepgram-token"
+  status = 200
+
 [[redirects]]
   from   = "/api/deepgram"
   to     = "/.netlify/functions/deepgram"
