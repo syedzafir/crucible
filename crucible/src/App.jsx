@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 
 // ── Palette ────────────────────────────────────────────────────────────────────
 const A    = "#5da8a0";
@@ -255,27 +255,39 @@ Return ONLY valid JSON, no markdown:
 // Haiku is fast enough (~1-2s) that non-streaming is simpler and more reliable
 // in sandboxed browser environments where TCP close signals are unpredictable.
 async function evaluateReport(prompt, onComplete, onError) {
+  // 30 second timeout — prevents stuck loading screen
+  const controller = new AbortController();
+  const timeout    = setTimeout(() => controller.abort(), 30000);
   try {
     const resp = await fetch("/api/messages", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
+      signal: controller.signal,
       body:JSON.stringify({
         model:"claude-haiku-4-5-20251001",
-        max_tokens:1400,
+        max_tokens:2500,   // rubric prompt ~1700 tokens + dual-verbosity response ~800 tokens
         messages:[{role:"user",content:prompt}],
       }),
     });
+    clearTimeout(timeout);
     if(!resp.ok){
       const errText = await resp.text().catch(()=>"");
-      throw new Error(`API error ${resp.status}${errText?`: ${errText.slice(0,120)}`:""}`)
+      throw new Error(`Feedback API error ${resp.status}${errText?`: ${errText.slice(0,120)}`:""}`)
     }
     const data     = await resp.json();
+    if(data.error)  throw new Error("Anthropic error: " + (data.error.message || JSON.stringify(data.error)));
     const raw      = data.content.map(b=>b.text||"").join("");
     const stripped = raw.replace(/```json|```/gi,"").trim();
     const match    = stripped.match(/\{[\s\S]*\}/);
-    if(!match) throw new Error(`Unexpected response. Preview: ${stripped.slice(0,120)}`);
+    if(!match) throw new Error(`No JSON in response. Model said: ${stripped.slice(0,200)}`);
     onComplete(JSON.parse(match[0]));
-  }catch(err){ onError(err.message??"Feedback service unavailable."); }
+  } catch(err) {
+    clearTimeout(timeout);
+    if(err.name === "AbortError")
+      onError("Feedback timed out after 30 seconds — please try again.");
+    else
+      onError(err.message ?? "Feedback service unavailable.");
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -703,7 +715,7 @@ const FIELD_TO_RUBRIC = {
 const SENTIMENT_COLORS = { correct:"#4ade80", incorrect:"#f87171", uncertain:"#fbbf24" };
 
 function sentimentFor(fieldLabel, feedback) {
-  if(!feedback) return null;
+  if(!feedback?.sections) return null;
   const rubric = FIELD_TO_RUBRIC[fieldLabel];
   if(!rubric) return null;
   const section = feedback.sections.find(s=>s.label===rubric);
@@ -1276,7 +1288,9 @@ export default function Crucible(){
     const params = new URLSearchParams({
       model:           "nova-3-medical",  // Nova-3 Medical for radiology accuracy
       language:        "en-US",
-      smart_format:    "true",   // punctuation + capitalisation
+      smart_format:    "true",   // auto punctuation + capitalisation
+      punctuate:       "true",   // explicit punctuation model
+      disfluencies:    "false",  // remove um, uh, er
       interim_results: "true",   // live word preview
       utterance_end_ms:"1000",   // finalise after 1s silence
       encoding:        "linear16",
@@ -1332,10 +1346,31 @@ export default function Crucible(){
       const isFinal = msg.is_final;
       if(!text.trim()) return;
 
+      // Voice command substitution — spoken punctuation → symbols
+      // Matches Powerscribe/Fluency behaviour
+      const applyVoiceCommands = (t) => t
+        .replace(/\bperiod\b/gi,           ".")
+        .replace(/\bfull stop\b/gi,         ".")
+        .replace(/\bcomma\b/gi,             ",")
+        .replace(/\bsemicolon\b/gi,         ";")
+        .replace(/\bcolon\b/gi,             ":")
+        .replace(/\bquestion mark\b/gi,     "?")
+        .replace(/\bexclamation mark\b/gi,  "!")
+        .replace(/\bopen bracket\b/gi,      "(")
+        .replace(/\bclose bracket\b/gi,     ")")
+        .replace(/\bnew line\b/gi,          "\n")
+        .replace(/\bnew paragraph\b/gi,     "\n\n")
+        .replace(/\bhyphen\b/gi,            "-")
+        .replace(/\bdash\b/gi,              " — ")
+        .replace(/\bopen quote\b/gi,        "\"")
+        .replace(/\bclose quote\b/gi,       "\"")
+        .trim();
+
       if(isFinal){
-        // Lock this text permanently
+        // Lock this text permanently, applying voice commands
+        const corrected = applyVoiceCommands(text);
         const sep = finalTextRef.current && !finalTextRef.current.endsWith(" ") ? " " : "";
-        finalTextRef.current += sep + text;
+        finalTextRef.current += sep + corrected;
         setInterimText("");
       } else {
         // Show live preview (will be overwritten or finalised)
@@ -1424,6 +1459,22 @@ Text: ${text}` }],
       }
     } catch(e) { setAvailableMics([]); }
   };
+
+  // ── Font loading ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const l = document.createElement("link");
+    l.href = "https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=DM+Mono:wght@300;400;500&display=swap";
+    l.rel  = "stylesheet";
+    document.head.appendChild(l);
+    return () => { try{ document.head.removeChild(l); }catch(e){} };
+  }, []);
+
+  // ── Elapsed timer — counts while in dictate phase ────────────────────────
+  useEffect(() => {
+    if(phase !== "dictate") return;
+    const t = setInterval(() => setElapsed(e => e + 1), 1000);
+    return () => clearInterval(t);
+  }, [phase]);
 
   // ── Alt+D keyboard shortcut ───────────────────────────────────────────────
   useEffect(() => {
@@ -1536,9 +1587,18 @@ Text: ${text}` }],
   };
 
   const handleReset=()=>{
-    setPhase("dictate"); setFindings(""); setImpression("");
-    setSfFields(BLANK_SF); setElapsed(0); setFeedback(null);
-    setApiError(null); setFlaggedItems(new Set()); setShowReport(false); // Note: reviewQueue persists
+    stopDictation();                          // release mic + close WebSocket
+    setPhase("dictate");
+    setFindings(""); setImpression("");
+    setSfFields(BLANK_SF);
+    setElapsed(0);
+    setFeedback(null);
+    setApiError(null);
+    setFlaggedItems(new Set());
+    setShowReport(false);
+    setConvertedFrom(null);                   // clear conversion hint
+    setInterimText("");                       // clear any live interim text
+    // reviewQueue and rubricMeta persist across cases intentionally
   };
 
   // Review queue handlers
